@@ -10,18 +10,34 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ macos-14, macos-15 ]
+        include:
+          - os: macos-14
+            prefix: /opt/homebrew
+            asset: llvm-pgo-22.1.8_2-arm64/llvm-pgo-22.1.8_2.arm64_opt-homebrew.tar.gz
+            sha: 94f76fb55ec64490605d0e68115259426a428a78f269f7e9160726d90a22e197
+          - os: macos-15
+            prefix: /opt/homebrew
+            asset: llvm-pgo-22.1.8_2-arm64/llvm-pgo-22.1.8_2.arm64_opt-homebrew.tar.gz
+            sha: 94f76fb55ec64490605d0e68115259426a428a78f269f7e9160726d90a22e197
+          - os: macos-15-intel
+            prefix: /usr/local
+            asset: llvm-pgo-22.1.8_2-x64/llvm-pgo-22.1.8_2.x86_64_usr-local.tar.gz
+            sha: 8f1f1d97e4a5391c7f871bc5cf9601a9b4a1262e6e61f1538327bb48d7ef71ed
+          - os: macos-26-intel
+            prefix: /usr/local
+            asset: llvm-pgo-22.1.8_2-x64/llvm-pgo-22.1.8_2.x86_64_usr-local.tar.gz
+            sha: 8f1f1d97e4a5391c7f871bc5cf9601a9b4a1262e6e61f1538327bb48d7ef71ed
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
       - name: Install keg from release
         run: |
-          curl -fsSL -o /tmp/k.tar.gz https://github.com/MeshInspector/toolchains/releases/download/llvm-pgo-22.1.8_2-arm64/llvm-pgo-22.1.8_2.arm64_opt-homebrew.tar.gz
-          echo "94f76fb55ec64490605d0e68115259426a428a78f269f7e9160726d90a22e197  /tmp/k.tar.gz" | shasum -a 256 -c -
-          tar -xzf /tmp/k.tar.gz -C /opt/homebrew/Cellar
-          ln -sfn ../Cellar/llvm-pgo/22.1.8_2 /opt/homebrew/opt/llvm-pgo
+          curl -fsSL -o /tmp/k.tar.gz "https://github.com/MeshInspector/toolchains/releases/download/${{ matrix.asset }}"
+          echo "${{ matrix.sha }}  /tmp/k.tar.gz" | shasum -a 256 -c -
+          tar -xzf /tmp/k.tar.gz -C "${{ matrix.prefix }}/Cellar"
+          ln -sfn ../Cellar/llvm-pgo/22.1.8_2 "${{ matrix.prefix }}/opt/llvm-pgo"
           brew install --quiet zstd xz
-          /opt/homebrew/Cellar/llvm-pgo/22.1.8_2/bin/clang++ --version | head -n1
+          "${{ matrix.prefix }}/Cellar/llvm-pgo/22.1.8_2/bin/clang++" --version | head -n1
 
       - name: Install comparison bottle (llvm@22)
         run: |
@@ -46,7 +62,7 @@ jobs:
           template<int... I> long all(std::integer_sequence<int,I...>) { return (touch<I>() + ...); }
           int main() { auto v = std::views::iota(0,10) | std::views::transform([](int i){return i*i;}); long s=0; for (int x : v) s+=x; return (int)(s + all(std::make_integer_sequence<int,120>{})) & 0; }
           CPP
-          PGO=/opt/homebrew/Cellar/llvm-pgo/22.1.8_2/bin/clang++
+          PGO="${{ matrix.prefix }}/Cellar/llvm-pgo/22.1.8_2/bin/clang++"
           V22="$(brew --prefix llvm@22)/bin/clang++"
           EXTRA=(-isysroot "$(xcrun --show-sdk-path)")
           for round in 1 2 3 4 5 6 7; do
