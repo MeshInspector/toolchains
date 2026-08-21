@@ -26,6 +26,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container: rockylinux:8
     timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Install build deps
         run: |
@@ -50,7 +53,7 @@ jobs:
             -DLLVM_TARGETS_TO_BUILD=Native \
             -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
             -DCMAKE_INSTALL_PREFIX=/opt/stage1
-          ninja -C stage1 install-distribution 2>/dev/null || ninja -C stage1 install
+          ninja -C stage1 install
           /opt/stage1/bin/clang++ --version | head -n1
 
       - name: Stage 2 instrumented + training
@@ -108,6 +111,9 @@ jobs:
     timeout-minutes: 350
     permissions:
       contents: write
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Install build deps
         run: |
@@ -156,7 +162,7 @@ jobs:
           dnf -y install gh
           NAME="clang-22.1.8-pgo-rockylinux8-${{ matrix.arch }}.tar.gz"
           tar -C /opt -czf "/tmp/$NAME" llvm-pgo-22.1.8
-          shasum -a 256 "/tmp/$NAME" 2>/dev/null || sha256sum "/tmp/$NAME" | tee "/tmp/$NAME.sha256"
+          sha256sum "/tmp/$NAME" | tee "/tmp/$NAME.sha256"
           gh release create clang-22.1.8-pgo-rockylinux8 -R "$GITHUB_REPOSITORY" \
             --title "clang 22.1.8 PGO (RockyLinux 8)" \
             --notes "clang/lld 22.1.8 built with -O3 + IR-PGO + ThinLTO in a rockylinux:8 container (glibc 2.28). Stage1 gcc-toolset-11; training = compiling LLVMSupport/Core/Analysis. Install prefix inside the tarball: llvm-pgo-22.1.8/." \
