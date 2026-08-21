@@ -1,0 +1,57 @@
+name: Validate llvm-pgo keg
+
+on:
+  push:
+    paths: [ '.github/workflows/validate-llvm-pgo.yml' ]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ macos-14, macos-15 ]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Install keg from release
+        run: |
+          curl -fsSL -o /tmp/k.tar.gz https://github.com/MeshInspector/toolchains/releases/download/llvm-pgo-22.1.8_2-arm64/llvm-pgo-22.1.8_2.arm64_opt-homebrew.tar.gz
+          echo "94f76fb55ec64490605d0e68115259426a428a78f269f7e9160726d90a22e197  /tmp/k.tar.gz" | shasum -a 256 -c -
+          tar -xzf /tmp/k.tar.gz -C /opt/homebrew/Cellar
+          ln -sfn ../Cellar/llvm-pgo/22.1.8_2 /opt/homebrew/opt/llvm-pgo
+          brew install --quiet zstd xz
+          /opt/homebrew/Cellar/llvm-pgo/22.1.8_2/bin/clang++ --version | head -n1
+
+      - name: Install comparison bottle (llvm@22)
+        run: |
+          brew update
+          brew install --quiet llvm@22
+          "$(brew --prefix llvm@22)/bin/clang++" --version | head -n1
+
+      - name: Bench
+        run: |
+          cat > /tmp/bench.cpp <<'CPP'
+          #include <regex>
+          #include <ranges>
+          #include <algorithm>
+          #include <map>
+          #include <variant>
+          #include <string>
+          #include <vector>
+          template<int N> struct Fib { static constexpr long v = Fib<N-1>::v + Fib<N-2>::v; };
+          template<> struct Fib<0> { static constexpr long v = 0; };
+          template<> struct Fib<1> { static constexpr long v = 1; };
+          template<int N> long touch() { std::regex r("a+b" + std::to_string(N)); std::map<std::string,std::variant<int,double,std::string>> m; m["x"]=N; return Fib<N%40>::v + (long)m.size(); }
+          template<int... I> long all(std::integer_sequence<int,I...>) { return (touch<I>() + ...); }
+          int main() { auto v = std::views::iota(0,10) | std::views::transform([](int i){return i*i;}); long s=0; for (int x : v) s+=x; return (int)(s + all(std::make_integer_sequence<int,120>{})) & 0; }
+          CPP
+          PGO=/opt/homebrew/Cellar/llvm-pgo/22.1.8_2/bin/clang++
+          V22="$(brew --prefix llvm@22)/bin/clang++"
+          EXTRA=(-isysroot "$(xcrun --show-sdk-path)")
+          for round in 1 2 3 4 5 6 7; do
+            for c in "$PGO" "$V22"; do
+              T="$( { /usr/bin/time -p "$c" "${EXTRA[@]}" -std=c++2b -O2 -c /tmp/bench.cpp -o /tmp/bench.o; } 2>&1 | grep '^real' )" || T="real FAIL"
+              echo "round=$round clang=$(basename "$(dirname "$(dirname "$c")")") $T"
+            done
+          done
