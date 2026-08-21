@@ -1,0 +1,164 @@
+name: Build clang linux PGO
+
+# Build clang 22.1.8 with -O3 + PGO + ThinLTO for RockyLinux 8 (glibc 2.28),
+# x64 and arm64, using the upstream 3-stage flow. Split into two chained jobs
+# per arch to stay under the 6h hosted-job cap. The final job publishes the
+# install tree to this repo's releases.
+
+on:
+  push:
+    branches: [ clang-linux-pgo ]
+  workflow_dispatch:
+
+env:
+  LLVM_VER: 22.1.8
+
+jobs:
+  stage1:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container: rockylinux:8
+    timeout-minutes: 350
+    steps:
+      - name: Install build deps
+        run: |
+          echo "install_weak_deps=false" >> /etc/dnf/dnf.conf
+          dnf -y install 'dnf-command(config-manager)'
+          dnf config-manager --set-enabled powertools
+          dnf -y install gcc-toolset-11 cmake ninja-build python3.12 git xz zlib-devel curl tar unzip binutils-devel
+
+      - name: Fetch sources
+        run: |
+          curl -fsSL -o llvm.tar.xz "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VER}/llvm-project-${LLVM_VER}.src.tar.xz"
+          tar -xf llvm.tar.xz
+          mv "llvm-project-${LLVM_VER}.src" llvm-project
+
+      - name: Stage 1 (gcc-toolset-11 -> clang+lld+compiler-rt)
+        run: |
+          source /opt/rh/gcc-toolset-11/enable
+          cmake -G Ninja -S llvm-project/llvm -B stage1 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_ENABLE_RUNTIMES="compiler-rt" \
+            -DLLVM_TARGETS_TO_BUILD=Native \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX=/opt/stage1
+          ninja -C stage1 install-distribution 2>/dev/null || ninja -C stage1 install
+          /opt/stage1/bin/clang++ --version | head -n1
+
+      - name: Stage 2 instrumented + training
+        run: |
+          cmake -G Ninja -S llvm-project/llvm -B stage2i \
+            -DCMAKE_C_COMPILER=/opt/stage1/bin/clang \
+            -DCMAKE_CXX_COMPILER=/opt/stage1/bin/clang++ \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DLLVM_TARGETS_TO_BUILD=Native \
+            -DLLVM_BUILD_INSTRUMENTED=IR \
+            -DLLVM_BUILD_RUNTIME=No \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF
+          ninja -C stage2i clang
+          # training: compile a slice of LLVM itself with the instrumented clang
+          export LLVM_PROFILE_FILE=/tmp/prof/%m-%p.profraw
+          mkdir -p /tmp/prof
+          cmake -G Ninja -S llvm-project/llvm -B train \
+            -DCMAKE_C_COMPILER=$PWD/stage2i/bin/clang \
+            -DCMAKE_CXX_COMPILER=$PWD/stage2i/bin/clang++ \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_TARGETS_TO_BUILD=Native \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF
+          ninja -C train LLVMSupport LLVMCore LLVMAnalysis
+          /opt/stage1/bin/llvm-profdata merge -output=/tmp/clang.profdata /tmp/prof/*.profraw
+          ls -la /tmp/clang.profdata
+
+      - name: Pack stage artifacts
+        run: |
+          tar -C /opt -czf /tmp/stage1-${{ matrix.arch }}.tar.gz stage1
+          ls -la /tmp/stage1-${{ matrix.arch }}.tar.gz /tmp/clang.profdata
+
+      - name: Upload stage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage1-${{ matrix.arch }}
+          path: |
+            /tmp/stage1-${{ matrix.arch }}.tar.gz
+            /tmp/clang.profdata
+          retention-days: 3
+          compression-level: 0
+
+  final:
+    needs: stage1
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container: rockylinux:8
+    timeout-minutes: 350
+    permissions:
+      contents: write
+    steps:
+      - name: Install build deps
+        run: |
+          echo "install_weak_deps=false" >> /etc/dnf/dnf.conf
+          dnf -y install 'dnf-command(config-manager)'
+          dnf config-manager --set-enabled powertools
+          dnf -y install gcc-toolset-11 cmake ninja-build python3.12 git xz zlib-devel curl tar unzip binutils-devel
+
+      - name: Fetch sources
+        run: |
+          curl -fsSL -o llvm.tar.xz "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VER}/llvm-project-${LLVM_VER}.src.tar.xz"
+          tar -xf llvm.tar.xz
+          mv "llvm-project-${LLVM_VER}.src" llvm-project
+
+      - name: Download stage artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: stage1-${{ matrix.arch }}
+          path: /tmp/
+
+      - name: Unpack stage1
+        run: tar -C /opt -xzf /tmp/stage1-${{ matrix.arch }}.tar.gz
+
+      - name: Final build (-O3 + PGO + ThinLTO)
+        run: |
+          cmake -G Ninja -S llvm-project/llvm -B final \
+            -DCMAKE_C_COMPILER=/opt/stage1/bin/clang \
+            -DCMAKE_CXX_COMPILER=/opt/stage1/bin/clang++ \
+            -DLLVM_USE_LINKER=/opt/stage1/bin/ld.lld \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_TARGETS_TO_BUILD=Native \
+            -DLLVM_PROFDATA_FILE=/tmp/clang.profdata \
+            -DLLVM_ENABLE_LTO=Thin \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX=/opt/llvm-pgo-22.1.8
+          ninja -C final install
+          /opt/llvm-pgo-22.1.8/bin/clang++ --version | head -n1
+
+      - name: Pack and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dnf -y install 'dnf-command(config-manager)' >/dev/null 2>&1 || true
+          dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
+          dnf -y install gh
+          NAME="clang-22.1.8-pgo-rockylinux8-${{ matrix.arch }}.tar.gz"
+          tar -C /opt -czf "/tmp/$NAME" llvm-pgo-22.1.8
+          shasum -a 256 "/tmp/$NAME" 2>/dev/null || sha256sum "/tmp/$NAME" | tee "/tmp/$NAME.sha256"
+          gh release create clang-22.1.8-pgo-rockylinux8 -R "$GITHUB_REPOSITORY" \
+            --title "clang 22.1.8 PGO (RockyLinux 8)" \
+            --notes "clang/lld 22.1.8 built with -O3 + IR-PGO + ThinLTO in a rockylinux:8 container (glibc 2.28). Stage1 gcc-toolset-11; training = compiling LLVMSupport/Core/Analysis. Install prefix inside the tarball: llvm-pgo-22.1.8/." \
+            2>/dev/null || echo "release exists"
+          gh release upload clang-22.1.8-pgo-rockylinux8 -R "$GITHUB_REPOSITORY" --clobber "/tmp/$NAME" "/tmp/$NAME.sha256"
