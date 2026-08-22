@@ -148,6 +148,7 @@ jobs:
             -DLLVM_TARGETS_TO_BUILD=Native \
             -DLLVM_PROFDATA_FILE=/tmp/clang.profdata \
             -DLLVM_ENABLE_LTO=Thin \
+            -DLLVM_ENABLE_RTTI=ON \
             -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
             -DCMAKE_INSTALL_PREFIX=/opt/llvm-pgo-22.1.8
           ninja -C final install
