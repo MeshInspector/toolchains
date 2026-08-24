@@ -14,6 +14,7 @@ URL that `curl` can fetch anonymously.
 | Tag | Platform | Archs | Unpacks to | Size | Status |
 | --- | --- | --- | --- | --- | --- |
 | [`clang-22.1.8-pgo-dylib-linux`](https://github.com/MeshInspector/toolchains/releases/tag/clang-22.1.8-pgo-dylib-linux) | Linux, glibc >= 2.28 | `x86_64`, `aarch64` | `llvm-pgo-dylib-22.1.8/` | ~185 MB | **current** |
+| [`clang-18.1.8-pgo-dylib-linux`](https://github.com/MeshInspector/toolchains/releases/tag/clang-18.1.8-pgo-dylib-linux) | Linux, glibc >= 2.28 | `x86_64`, `aarch64` | `llvm-pgo-dylib-18.1.8/` | ~178 MB | **current** |
 | [`clang-22.1.8-pgo-rockylinux8`](https://github.com/MeshInspector/toolchains/releases/tag/clang-22.1.8-pgo-rockylinux8) | Linux, glibc >= 2.28 | `x64`, `arm64` | `llvm-pgo-22.1.8/` | ~1 GB | superseded |
 | [`llvm-pgo-22.1.8_2-arm64`](https://github.com/MeshInspector/toolchains/releases/tag/llvm-pgo-22.1.8_2-arm64) | macOS arm64 | `arm64` | Homebrew keg under `/opt/homebrew` | ~438 MB | **current** |
 | [`llvm-pgo-22.1.8_2-x64`](https://github.com/MeshInspector/toolchains/releases/tag/llvm-pgo-22.1.8_2-x64) | macOS Intel | `x86_64` | Homebrew keg under `/usr/local` | ~468 MB | **current** |
@@ -65,6 +66,26 @@ One host requirement: the keg picks its default libstdc++ from `/opt/rh`, and
 clang 22 only scans that tree up to `gcc-toolset-13`. Install
 `gcc-toolset-13-gcc-c++` — the `-gcc-c++` package, not just `libstdc++-devel`,
 because detection keys on `crtbegin.o` — or the C++ standard library is not found.
+
+## clang 18.1.8 PGO dylib (Linux) — `clang-18.1.8-pgo-dylib-linux`
+
+The same recipe, container and flags as the 22.1.8 dylib keg above, built from
+llvmorg-18.1.8 (the last 18.x release) for consumers that need clang 18 rather
+than 22. Install it the same way — only the version differs:
+
+    TOOLCHAIN=clang-18.1.8-pgo-dylib-linux
+    ASSET=${TOOLCHAIN}-$(uname -m).tar.gz
+    BASE=https://github.com/MeshInspector/toolchains/releases/download/${TOOLCHAIN}
+    curl -fsSL -O "${BASE}/${ASSET}" -O "${BASE}/${ASSET}.sha256"
+    sha256sum -c "${ASSET}.sha256"
+    tar -C /opt -xzf "${ASSET}"
+    /opt/llvm-pgo-dylib-18.1.8/bin/clang++ --version
+
+    eb544c6ebe6db2a5ebc3cb288c021bbbc6242ae324245d74e221d94d539bbcd4  clang-18.1.8-pgo-dylib-linux-x86_64.tar.gz
+    684e54fe27645450dd9b63f9cdf7b9c30d09cb69a72e07d5aaa9f9b1f94fc6fc  clang-18.1.8-pgo-dylib-linux-aarch64.tar.gz
+
+This major installs the dylibs as `libLLVM.so.18.1` and `libclang-cpp.so.18.1`,
+with `libLLVM-18.so` and the unsuffixed `libLLVM.so` as symlinks beside them.
 
 ## clang 22.1.8 PGO static + ThinLTO (Linux) — `clang-22.1.8-pgo-rockylinux8`
 
@@ -139,10 +160,20 @@ runs exactly the commands above.
 
 ## Rebuilding
 
-The Linux recipe lives on the [`clang-linux-pgo`](https://github.com/MeshInspector/toolchains/tree/clang-linux-pgo)
-branch: a two-job chain per arch, in a `rockylinux:8` container, stage1
-`gcc-toolset-11` -> IR-instrumented stage2 trained on compiling
-LLVMSupport/Core/Analysis -> final build with the profile.
+The Linux recipe is a two-job chain per arch, in a `rockylinux:8` container:
+stage1 `gcc-toolset-11` -> IR-instrumented stage2 trained on compiling
+LLVMSupport/Core/Analysis -> final build with the profile. It lives on a branch
+per version, and pushing to that branch is what triggers the build:
+
+- [`clang-18-linux-pgo`](https://github.com/MeshInspector/toolchains/tree/clang-18-linux-pgo)
+  built 18.1.8. `LLVM_VER` is the only knob — it drives the source tarball, the
+  install prefix, the release tag and the asset names — so the next version is a
+  one-line change on a new branch.
+- [`clang-linux-pgo`](https://github.com/MeshInspector/toolchains/tree/clang-linux-pgo)
+  built 22.1.8, and its history also holds the static+ThinLTO config.
+
+Budget roughly 3h of hosted-runner wall clock for a dylib build (18.1.8 took
+2h56m for all four jobs); the static+ThinLTO flavor took closer to 8h.
 
 The macOS kegs are built on the self-hosted macOS runners by
 `brew install --build-bottle` from a local tap, then packed straight out of the
