@@ -51,11 +51,15 @@ sha256 of the tarballs:
     97b40230ff3c65e567b532b3a7cff009b0f3d397b3b5311816743a50f5641727  clang-22.1.8-pgo-dylib-linux-x86_64.tar.gz
     41e405b76822e19b7d6cf00db648d290ad78b274fd03a970b91a0bbbb76af5d7  clang-22.1.8-pgo-dylib-linux-aarch64.tar.gz
 
-The `.sha256` sidecar assets still spell the pre-rename temp paths inside, so
-`sha256sum -c` fed one of them directly fails on a missing file. Compare the
-digest against the name you actually downloaded instead:
+Each tarball has a `.sha256` sidecar asset that names the tarball itself, so
+fetching both side by side and running `sha256sum -c` just works:
 
-    echo "97b40230ff3c65e567b532b3a7cff009b0f3d397b3b5311816743a50f5641727  clang.tar.gz" | sha256sum -c -
+    TOOLCHAIN=clang-22.1.8-pgo-dylib-linux
+    ASSET=${TOOLCHAIN}-$(uname -m).tar.gz
+    BASE=https://github.com/MeshInspector/toolchains/releases/download/${TOOLCHAIN}
+    curl -fsSL -O "${BASE}/${ASSET}" -O "${BASE}/${ASSET}.sha256"
+    sha256sum -c "${ASSET}.sha256"
+    tar -C /opt -xzf "${ASSET}"
 
 One host requirement: the keg picks its default libstdc++ from `/opt/rh`, and
 clang 22 only scans that tree up to `gcc-toolset-13`. Install
@@ -71,8 +75,11 @@ dylib switch; kept for reference and A/B measurements.
 
     ARCH=x64   # or arm64 -- this release predates the uname-style asset names
     TOOLCHAIN=clang-22.1.8-pgo-rockylinux8
-    curl -fsSL -o /tmp/clang.tar.gz "https://github.com/MeshInspector/toolchains/releases/download/${TOOLCHAIN}/${TOOLCHAIN}-${ARCH}.tar.gz"
-    tar -C /opt -xzf /tmp/clang.tar.gz
+    ASSET=${TOOLCHAIN}-${ARCH}.tar.gz
+    BASE=https://github.com/MeshInspector/toolchains/releases/download/${TOOLCHAIN}
+    curl -fsSL -O "${BASE}/${ASSET}" -O "${BASE}/${ASSET}.sha256"
+    sha256sum -c "${ASSET}.sha256"
+    tar -C /opt -xzf "${ASSET}"
     /opt/llvm-pgo-22.1.8/bin/clang++ --version
 
     3deac7c02e46b7d048e80c78d097622eab7927671d99e4307d1c3a7a9f48a7d2  clang-22.1.8-pgo-rockylinux8-x64.tar.gz
@@ -112,7 +119,9 @@ Intel (`/usr/local`):
 
 `zstd` and `xz` are the runtime deps that actually matter; `python@3.14` is only
 needed for lldb. The full set of external brew deps the keg links against is the
-`deps.txt` asset of each release, and `sha256.txt` carries the digest above.
+`deps.txt` asset of each release. Each release also has a `sha256.txt` naming its
+own tarball, so `shasum -a 256 -c sha256.txt` works if you download both into the
+same directory instead of pasting the digest.
 
 In MeshLib CI this is wrapped as a composite action,
 `.github/actions/install-llvm-pgo-keg`, which no-ops when the keg is already in
