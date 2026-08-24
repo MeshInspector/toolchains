@@ -1,17 +1,21 @@
 name: Build clang linux PGO
 
-# Build clang 22.1.8 with -O3 + PGO + ThinLTO for RockyLinux 8 (glibc 2.28),
-# x64 and arm64, using the upstream 3-stage flow. Split into two chained jobs
-# per arch to stay under the 6h hosted-job cap. The final job publishes the
-# install tree to this repo's releases.
+# Build clang with -O3 + PGO (dylib flavor, no LTO) for RockyLinux 8
+# (glibc 2.28), x64 and arm64, using the upstream 3-stage flow. Split into two
+# chained jobs per arch to stay under the 6h hosted-job cap. The final job
+# publishes the install tree to this repo's releases.
+#
+# The version is the only knob: LLVM_VER drives the source tarball, the install
+# prefix (llvm-pgo-dylib-<ver>), the release tag (clang-<ver>-pgo-dylib-linux)
+# and the asset names (<tag>-$(uname -m).tar.gz).
 
 on:
   push:
-    branches: [ clang-linux-pgo ]
+    branches: [ clang-18-linux-pgo ]
   workflow_dispatch:
 
 env:
-  LLVM_VER: 22.1.8
+  LLVM_VER: 18.1.8
 
 jobs:
   stage1:
@@ -138,9 +142,8 @@ jobs:
         run: tar -C /opt -xzf /tmp/stage1-${{ matrix.arch }}.tar.gz
 
       # Dylib flavor: no LTO, distro-style libLLVM.so + libclang-cpp.so for
-      # near-instant dynamic linking of clang tools (mrbind). The static+ThinLTO
-      # flavor already published under clang-22.1.8-pgo-rockylinux8 stays as is;
-      # see git history for its exact config.
+      # near-instant dynamic linking of clang tools (mrbind), RTTI on because
+      # mrbind's clang plugins need it.
       - name: Final build (-O3 + PGO, dylib)
         run: |
           cmake -G Ninja -S llvm-project/llvm -B final \
@@ -156,23 +159,25 @@ jobs:
             -DLLVM_LINK_LLVM_DYLIB=ON \
             -DCLANG_LINK_CLANG_DYLIB=ON \
             -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
-            -DCMAKE_INSTALL_PREFIX=/opt/llvm-pgo-dylib-22.1.8
+            -DCMAKE_INSTALL_PREFIX="/opt/llvm-pgo-dylib-${LLVM_VER}"
           ninja -C final install
-          /opt/llvm-pgo-dylib-22.1.8/bin/clang++ --version | head -n1
-          ls /opt/llvm-pgo-dylib-22.1.8/lib/libLLVM.so /opt/llvm-pgo-dylib-22.1.8/lib/libclang-cpp.so
+          "/opt/llvm-pgo-dylib-${LLVM_VER}/bin/clang++" --version | head -n1
+          # 18 installs libLLVM-18.so, later majors libLLVM.so.<ver> -- match both
+          ls -la "/opt/llvm-pgo-dylib-${LLVM_VER}"/lib/libLLVM*.so* "/opt/llvm-pgo-dylib-${LLVM_VER}"/lib/libclang-cpp*.so*
 
       - name: Pack and publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          dnf -y install 'dnf-command(config-manager)' >/dev/null 2>&1 || true
           dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
           dnf -y install gh
-          NAME="clang-22.1.8-pgo-dylib-rockylinux8-${{ matrix.arch }}.tar.gz"
-          tar -C /opt -czf "/tmp/$NAME" llvm-pgo-dylib-22.1.8
-          sha256sum "/tmp/$NAME" | tee "/tmp/$NAME.sha256"
-          gh release create clang-22.1.8-pgo-dylib-rockylinux8 -R "$GITHUB_REPOSITORY" \
-            --title "clang 22.1.8 PGO dylib (RockyLinux 8)" \
-            --notes "clang/lld 22.1.8 built with -O3 + IR-PGO (no LTO), RTTI, and distro-style libLLVM.so/libclang-cpp.so in a rockylinux:8 container (glibc 2.28). Stage1 gcc-toolset-11; training = compiling LLVMSupport/Core/Analysis. Install prefix inside the tarball: llvm-pgo-dylib-22.1.8/." \
+          TAG="clang-${LLVM_VER}-pgo-dylib-linux"
+          NAME="${TAG}-$(uname -m).tar.gz"
+          tar -C /opt -czf "/tmp/$NAME" "llvm-pgo-dylib-${LLVM_VER}"
+          # hash from inside /tmp so the sidecar names the asset, not a temp path
+          ( cd /tmp && sha256sum "$NAME" | tee "$NAME.sha256" )
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --title "clang ${LLVM_VER} PGO dylib (Linux)" \
+            --notes "clang/lld ${LLVM_VER} built with -O3 + IR-PGO (no LTO), RTTI, and distro-style libLLVM.so/libclang-cpp.so in a rockylinux:8 container (glibc 2.28). Stage1 gcc-toolset-11; training = compiling LLVMSupport/Core/Analysis. Install prefix inside the tarball: llvm-pgo-dylib-${LLVM_VER}/." \
             2>/dev/null || echo "release exists"
-          gh release upload clang-22.1.8-pgo-dylib-rockylinux8 -R "$GITHUB_REPOSITORY" --clobber "/tmp/$NAME" "/tmp/$NAME.sha256"
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber "/tmp/$NAME" "/tmp/$NAME.sha256"
