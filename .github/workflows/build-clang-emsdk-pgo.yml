@@ -64,8 +64,9 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qqy
           apt-get install -qqy --no-install-recommends \
-            build-essential cmake ninja-build git curl xz-utils zlib1g-dev python3
+            build-essential cmake ninja-build lld git curl xz-utils zlib1g-dev python3
           cmake --version | head -1
+          gcc --version | head -1
 
       - name: Fetch llvm-project at the emsdk revision
         run: |
@@ -76,15 +77,19 @@ jobs:
           rm llvm.tar.gz
           grep -h "set(LLVM_VERSION_" llvm-project/cmake/Modules/LLVMVersion.cmake
 
-      # The stock emsdk clang ships compiler-rt for wasm only, so it cannot link
-      # -fprofile-generate binaries. Stage1 exists to provide a clang of the same
-      # revision *with* the host profile runtime, plus ld.lld for the final link.
-      - name: Stage 1 (stock emsdk clang -> clang + lld + host compiler-rt)
+      # Stage1 provides what the stock emsdk clang cannot: a host profile runtime
+      # (emsdk ships compiler-rt for wasm only, so its clang cannot link
+      # -fprofile-generate binaries) and ld.lld for the final link. The emsdk
+      # clang cannot even serve as the bootstrap compiler: the arm64 one is
+      # cross-built for wasm and reports its own host target as 'unknown', so
+      # stage1 is built with the distro gcc, as in our other PGO recipes.
+      - name: Stage 1 (distro gcc -> clang + lld + host compiler-rt)
         run: |
           set -euo pipefail
           cmake -G Ninja -S llvm-project/llvm -B stage1 \
-            -DCMAKE_C_COMPILER=/emsdk/upstream/bin/clang \
-            -DCMAKE_CXX_COMPILER=/emsdk/upstream/bin/clang++ \
+            -DCMAKE_C_COMPILER=gcc \
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DLLVM_USE_LINKER=lld \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_ENABLE_PROJECTS="clang;lld" \
             -DLLVM_ENABLE_RUNTIMES="compiler-rt" \
@@ -191,7 +196,7 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qqy
           apt-get install -qqy --no-install-recommends \
-            build-essential cmake ninja-build git curl xz-utils zlib1g-dev python3 ca-certificates
+            build-essential cmake ninja-build lld git curl xz-utils zlib1g-dev python3 ca-certificates
 
       - name: Fetch llvm-project at the emsdk revision
         run: |
