@@ -14,6 +14,7 @@ URL that `curl` can fetch anonymously.
 | Tag | Platform | Archs | Unpacks to | Size | Status |
 | --- | --- | --- | --- | --- | --- |
 | [`clang-22.1.8-pgo-dylib-linux`](https://github.com/MeshInspector/toolchains/releases/tag/clang-22.1.8-pgo-dylib-linux) | Linux, glibc >= 2.28 | `x86_64`, `aarch64` | `llvm-pgo-dylib-22.1.8/` | ~185 MB | **current** |
+| [`clang-emsdk-4.0.19-pgo`](https://github.com/MeshInspector/toolchains/releases/tag/clang-emsdk-4.0.19-pgo) | `emscripten/emsdk:4.0.19` (jammy, glibc >= 2.35) | `x86_64`, `aarch64` | `llvm-emsdk-4.0.19-pgo/` | ~114 MB | **current** |
 | [`clang-18.1.8-pgo-dylib-linux`](https://github.com/MeshInspector/toolchains/releases/tag/clang-18.1.8-pgo-dylib-linux) | Linux, glibc >= 2.28 | `x86_64`, `aarch64` | `llvm-pgo-dylib-18.1.8/` | ~178 MB | **current** |
 | [`clang-22.1.8-pgo-rockylinux8`](https://github.com/MeshInspector/toolchains/releases/tag/clang-22.1.8-pgo-rockylinux8) | Linux, glibc >= 2.28 | `x64`, `arm64` | `llvm-pgo-22.1.8/` | ~1 GB | superseded |
 | [`llvm-pgo-22.1.8_2-arm64`](https://github.com/MeshInspector/toolchains/releases/tag/llvm-pgo-22.1.8_2-arm64) | macOS arm64 | `arm64` | Homebrew keg under `/opt/homebrew` | ~438 MB | **current** |
@@ -29,6 +30,58 @@ Asset names are stable once published, but a *tag* can be renamed in place (that
 is how `clang-22.1.8-pgo-dylib-rockylinux8` became `clang-22.1.8-pgo-dylib-linux`),
 which 404s the old URLs. Pin the tag in exactly one place per consumer so a
 rename stays a one-line fix.
+
+## clang for Emscripten, PGO — `clang-emsdk-4.0.19-pgo`
+
+The compiler `emscripten/emsdk:4.0.19` ships, rebuilt with PGO. Upstream builds
+that toolchain with ThinLTO and assertions off but **no PGO** at all
+(`emscripten-releases` `src/build.py` has no `LLVM_BUILD_INSTRUMENTED`, no
+`LLVM_PROFDATA_FILE`, no BOLT), so this is `-O3` + IR-PGO + ThinLTO on top of the
+same configuration.
+
+It is the **same llvm-project revision emsdk pins**, `12f392cff` /
+`clang version 22.0.0git`, read out of the emscripten-releases `DEPS` for the
+4.0.19 tag. That matters: it keeps emcc's `EXPECTED_LLVM_VERSION = 22` check
+satisfied and keeps the image's prebuilt wasm sysroot and resource headers
+valid, so dropping it in is a compiler swap and nothing else.
+
+Point emscripten at it with `EM_LLVM_ROOT` — emscripten honours `EM_<KEY>` for
+any config key, so nothing under `/emsdk` has to be modified:
+
+    TOOLCHAIN=clang-emsdk-4.0.19-pgo
+    curl -fsSL --retry 5 --retry-all-errors "https://github.com/MeshInspector/toolchains/releases/download/${TOOLCHAIN}/${TOOLCHAIN}-$(uname -m).tar.gz" | tar -C /opt -xz
+    export EM_LLVM_ROOT=/opt/llvm-emsdk-4.0.19-pgo/bin
+    emcc --version
+
+Compile time against the stock emsdk compiler, same runner, template-heavy
+translation unit, `em++ -O3 -std=c++20 -c`, min of 5 with both caches warm:
+
+| arch | stock emsdk clang | this toolchain | delta |
+| --- | --- | --- | --- |
+| `x86_64` | 1647 ms | 1336 ms | **-18.9%** |
+| `aarch64` | 2159 ms | 1670 ms | **-22.6%** |
+
+sha256 of the tarballs:
+
+    65c70c0d997a9ab6a82c8ea6af5c69f46ac64bc96bd8816a3a29f445c7edc21d  clang-emsdk-4.0.19-pgo-x86_64.tar.gz
+    a740be411d2333189f28783af80a35b9efcbcabcdb5ef2ebd5d0650c9d9b764a  clang-emsdk-4.0.19-pgo-aarch64.tar.gz
+
+Two things to know before reusing this recipe for another emsdk version:
+
+* It is built **inside the target image**, not in `rockylinux:8` like the kegs
+  above, so the glibc floor is jammy's 2.35 rather than 2.28. That is deliberate:
+  the training step drives the image's own `embuilder` to profile the real
+  WebAssembly code paths (system libraries for wasm32 *and* wasm64), alongside a
+  slice of LLVM itself for the frontend and middle-end.
+* The emsdk clang cannot bootstrap it. Its compiler-rt is wasm-only, so it
+  cannot link `-fprofile-generate` binaries, and the arm64 one reports its own
+  host target as `unknown` because it is cross-built — a native CMake configure
+  with it fails outright. The recipe therefore builds a stage1 clang with the
+  distro gcc first.
+
+Only the `bin/` tree is needed by emscripten; the tarball also carries
+`lib/clang/22` from the same revision, which is why overlaying it onto
+`/emsdk/upstream` works too if `EM_LLVM_ROOT` is inconvenient.
 
 ## clang 22.1.8 PGO dylib (Linux) — `clang-22.1.8-pgo-dylib-linux`
 
