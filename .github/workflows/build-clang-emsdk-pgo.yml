@@ -19,6 +19,11 @@ on:
   push:
     branches: [ clang-emsdk-4.0.19-pgo ]
   workflow_dispatch:
+    inputs:
+      reuse_run_id:
+        description: "Take stage1 + clang.profdata from this earlier run instead of rebuilding them"
+        required: false
+        default: ""
 
 env:
   EMSDK_VER: 4.0.19
@@ -42,6 +47,7 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
             image: emscripten/emsdk:4.0.19-arm64
+    if: ${{ inputs.reuse_run_id == '' }}
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.image }}
     timeout-minutes: 350
@@ -104,7 +110,7 @@ jobs:
             -DLLVM_TARGETS_TO_BUILD=Native \
             -DLLVM_ENABLE_ASSERTIONS=OFF \
             -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
-            -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_ZSTD=OFF \
             -DCMAKE_INSTALL_PREFIX=/opt/stage1
           ninja -C stage1 install
           rm -rf stage1
@@ -116,10 +122,12 @@ jobs:
       - name: Stage 2 instrumented (IR-PGO)
         run: |
           set -euo pipefail
+          # by name on PATH: '-fuse-ld=<path>' is deprecated and warns per link
+          export PATH=/opt/stage1/bin:$PATH
           cmake -G Ninja -S llvm-project/llvm -B stage2i \
             -DCMAKE_C_COMPILER=/opt/stage1/bin/clang \
             -DCMAKE_CXX_COMPILER=/opt/stage1/bin/clang++ \
-            -DLLVM_USE_LINKER=/opt/stage1/bin/ld.lld \
+            -DLLVM_USE_LINKER=lld \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_ENABLE_PROJECTS="clang;lld" \
             -DLLVM_TARGETS_TO_BUILD="Native;WebAssembly" \
@@ -127,7 +135,7 @@ jobs:
             -DLLVM_BUILD_RUNTIME=No \
             -DLLVM_ENABLE_ASSERTIONS=OFF \
             -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
-            -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_TERMINFO=OFF
+            -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_ZSTD=OFF
           ninja -C stage2i clang clang-resource-headers lld llvm-ar llvm-nm llvm-ranlib \
             llvm-objcopy llvm-strip llvm-dwarfdump llvm-dwp llvm-symbolizer llvm-size llvm-cxxfilt
           ./stage2i/bin/clang --version | head -1
@@ -198,6 +206,9 @@ jobs:
 
   final:
     needs: stage1
+    # stage1 is skipped when reusing an earlier run's profile, and a skipped
+    # dependency would skip this job too without the always().
+    if: ${{ always() && (inputs.reuse_run_id != '' || needs.stage1.result == 'success') }}
     strategy:
       fail-fast: false
       matrix:
@@ -213,6 +224,7 @@ jobs:
     timeout-minutes: 350
     permissions:
       contents: write
+      actions: read
     defaults:
       run:
         shell: bash
@@ -238,6 +250,8 @@ jobs:
         with:
           name: stage1-${{ matrix.arch }}
           path: /tmp/
+          run-id: ${{ inputs.reuse_run_id || github.run_id }}
+          github-token: ${{ github.token }}
 
       - name: Unpack stage1
         run: tar -C /opt -xzf /tmp/stage1-${{ matrix.arch }}.tar.gz
@@ -248,10 +262,11 @@ jobs:
       - name: Final build (-O3 + PGO + ThinLTO)
         run: |
           set -euo pipefail
+          export PATH=/opt/stage1/bin:$PATH
           cmake -G Ninja -S llvm-project/llvm -B final \
             -DCMAKE_C_COMPILER=/opt/stage1/bin/clang \
             -DCMAKE_CXX_COMPILER=/opt/stage1/bin/clang++ \
-            -DLLVM_USE_LINKER=/opt/stage1/bin/ld.lld \
+            -DLLVM_USE_LINKER=lld \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_ENABLE_PROJECTS="clang;lld" \
             -DLLVM_TARGETS_TO_BUILD="Native;WebAssembly" \
@@ -260,7 +275,7 @@ jobs:
             -DLLVM_PARALLEL_LINK_JOBS=1 \
             -DLLVM_ENABLE_ASSERTIONS=OFF \
             -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
-            -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_ZSTD=OFF \
             -DLLVM_ENABLE_BINDINGS=OFF -DLLVM_INSTALL_TOOLCHAIN_ONLY=ON \
             -DLLVM_STATIC_LINK_CXX_STDLIB=ON \
             -DCLANG_ENABLE_ARCMT=OFF -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
@@ -274,21 +289,55 @@ jobs:
           ls "/opt/${PREFIX}/bin"
           du -sh "/opt/${PREFIX}"
 
+      # Packed and uploaded before validation runs: an hour of build output was
+      # lost once because the tarball was only created after a failing check.
+      - name: Pack
+        run: |
+          set -euo pipefail
+          NAME="${TAG}-$(uname -m).tar.gz"
+          cat "/tmp/${NAME}.sha256"
+
+      - name: Upload toolchain artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: toolchain-${{ matrix.arch }}
+          path: |
+            /tmp/${{ env.TAG }}-*.tar.gz
+            /tmp/${{ env.TAG }}-*.tar.gz.sha256
+          retention-days: 7
+          compression-level: 0
+
       - name: Validate against the image's emscripten
         run: |
           set -euo pipefail
           test -d /emsdk/upstream/lib/clang/22
-          export EM_LLVM_ROOT="/opt/${PREFIX}/bin"
+          node --version
           export EM_CACHE=/tmp/emcache-pgo
-          emcc --version | head -1
           printf '#include <cstdio>\n#include <vector>\n#include <algorithm>\nint main(){std::vector<int> v{5,3,1,4,2};std::sort(v.begin(),v.end());for(int x:v)std::printf("%%d",x);std::printf("\\n");}\n' > /tmp/t.cpp
-          cat /tmp/t.cpp
+          export EM_LLVM_ROOT="/opt/${PREFIX}/bin"
+          emcc --version | head -1
           em++ -O3 -std=c++20 /tmp/t.cpp -o /tmp/t.js
           node /tmp/t.js
           em++ -O3 -std=c++20 -pthread -msimd128 /tmp/t.cpp -o /tmp/tp.js
           node /tmp/tp.js
+          # wasm64: the link must succeed, but whether the module *instantiates*
+          # is the host V8's business -- node 22 here rejects 64-bit table limits
+          # whatever compiler produced them. So a run failure is accepted only
+          # when the stock toolchain fails identically in the same node.
           em++ -O3 -std=c++20 -sMEMORY64 /tmp/t.cpp -o /tmp/t64.js
-          node /tmp/t64.js
+          if node /tmp/t64.js > /tmp/o64.log 2>&1; then
+            echo "wasm64: ran under node: $(cat /tmp/o64.log)"
+          else
+            echo "wasm64: our module did not instantiate:"
+            grep -o "CompileError.*" /tmp/o64.log | head -1 || tail -2 /tmp/o64.log
+            EM_LLVM_ROOT=/emsdk/upstream/bin EM_CACHE=/tmp/emcache-stock em++ -O3 -std=c++20 -sMEMORY64 /tmp/t.cpp -o /tmp/t64s.js
+            if node /tmp/t64s.js > /tmp/o64s.log 2>&1; then
+              echo "but the stock toolchain RAN -- that is a regression in our build" >&2
+              exit 1
+            fi
+            echo "stock toolchain fails the same way -- node limitation, not the toolchain:"
+            grep -o "CompileError.*" /tmp/o64s.log | head -1 || tail -2 /tmp/o64s.log
+          fi
 
       - name: Benchmark stock vs PGO
         run: |
@@ -357,10 +406,7 @@ jobs:
             apt-get install -qqy /tmp/gh.deb
           }
           NAME="${TAG}-$(uname -m).tar.gz"
-          tar -C /opt -czf "/tmp/${NAME}" "${PREFIX}"
-          cd /tmp
-          sha256sum "${NAME}" | tee "${NAME}.sha256"
-          ls -la "/tmp/${NAME}"
+          cat "/tmp/${NAME}.sha256"
           gh release create "${TAG}" -R "$GITHUB_REPOSITORY" \
             --title "clang 22.0.0git PGO for emsdk ${EMSDK_VER}" \
             --notes "Drop-in replacement for /emsdk/upstream/bin in emscripten/emsdk:${EMSDK_VER}: the same llvm-project revision emsdk ships (${LLVM_SHA}, clang 22.0.0git), rebuilt with -O3 + IR-PGO + ThinLTO instead of upstream's ThinLTO-only release configuration. Built inside the emscripten/emsdk:${EMSDK_VER} image itself (Ubuntu jammy, glibc 2.35). Training: emscripten system libraries for wasm32 and wasm64 via embuilder, plus a slice of LLVM itself for the frontend and middle-end. Install prefix inside the tarball: ${PREFIX}/." \
