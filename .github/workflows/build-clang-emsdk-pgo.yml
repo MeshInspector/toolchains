@@ -83,7 +83,15 @@ jobs:
       # clang cannot even serve as the bootstrap compiler: the arm64 one is
       # cross-built for wasm and reports its own host target as 'unknown', so
       # stage1 is built with the distro gcc, as in our other PGO recipes.
+      - name: Cache stage1
+        id: stage1-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/stage1
+          key: stage1-${{ matrix.arch }}-${{ env.LLVM_SHA }}-gcc
+
       - name: Stage 1 (distro gcc -> clang + lld + host compiler-rt)
+        if: steps.stage1-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           cmake -G Ninja -S llvm-project/llvm -B stage1 \
@@ -134,12 +142,28 @@ jobs:
       - name: Training
         run: |
           set -euo pipefail
+          # %4m, not %m-%p: %p gives every clang invocation its own raw profile,
+          # and the sysroot builds below run thousands of them, which filled the
+          # runner's disk and killed the job. %4m is a bounded four-file pool
+          # that the profile runtime merges into online. Each phase is merged
+          # into a partial profdata and its raw files deleted, so peak disk
+          # stays flat no matter how long training runs.
           mkdir -p /tmp/prof
-          export LLVM_PROFILE_FILE=/tmp/prof/%m-%p.profraw
+          export LLVM_PROFILE_FILE=/tmp/prof/%4m.profraw
           export EM_LLVM_ROOT="$PWD/stage2i/bin"
           export EM_CACHE=/tmp/emcache-train
+          harvest() {
+            local name="$1"
+            echo "--- ${name}: $(ls /tmp/prof | wc -l) raw files, $(du -sh /tmp/prof | cut -f1)"
+            /opt/stage1/bin/llvm-profdata merge -output="/tmp/part-${name}.profdata" /tmp/prof/*.profraw
+            rm -f /tmp/prof/*.profraw
+            ls -la "/tmp/part-${name}.profdata"
+            df -h / | tail -1
+          }
           embuilder build SYSTEM --force
+          harvest wasm32
           embuilder build SYSTEM --force --wasm64
+          harvest wasm64
           cmake -G Ninja -S llvm-project/llvm -B train \
             -DCMAKE_C_COMPILER=$PWD/stage2i/bin/clang \
             -DCMAKE_CXX_COMPILER=$PWD/stage2i/bin/clang++ \
@@ -148,10 +172,13 @@ jobs:
             -DLLVM_ENABLE_ASSERTIONS=OFF \
             -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF
           ninja -C train LLVMSupport LLVMCore LLVMAnalysis LLVMCodeGen
-          echo "profraw files: $(ls /tmp/prof | wc -l), $(du -sh /tmp/prof | cut -f1)"
-          /opt/stage1/bin/llvm-profdata merge -output=/tmp/clang.profdata /tmp/prof/*.profraw
+          harvest host
+          /opt/stage1/bin/llvm-profdata merge -output=/tmp/clang.profdata \
+            /tmp/part-wasm32.profdata /tmp/part-wasm64.profdata /tmp/part-host.profdata
           ls -la /tmp/clang.profdata
-          rm -rf train stage2i /tmp/prof
+          /opt/stage1/bin/llvm-profdata show --topn=5 /tmp/clang.profdata | head -20
+          rm -rf train stage2i /tmp/prof /tmp/part-*.profdata /tmp/emcache-train
+          df -h / | tail -1
 
       - name: Pack stage1
         run: |
