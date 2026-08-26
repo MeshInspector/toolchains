@@ -295,7 +295,10 @@ jobs:
         run: |
           set -euo pipefail
           NAME="${TAG}-$(uname -m).tar.gz"
-          cat "/tmp/${NAME}.sha256"
+          tar -C /opt -czf "/tmp/${NAME}" "${PREFIX}"
+          cd /tmp
+          sha256sum "${NAME}" | tee "${NAME}.sha256"
+          ls -la "/tmp/${NAME}"
 
       - name: Upload toolchain artifact
         uses: actions/upload-artifact@v4
@@ -395,7 +398,7 @@ jobs:
             echo "| this build (-O3 + PGO + ThinLTO) | ${PGO} ms |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Pack and publish
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
