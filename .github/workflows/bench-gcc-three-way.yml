@@ -39,34 +39,42 @@ env:
   COMMON_CONF: --enable-languages=c,c++ --disable-multilib --disable-libsanitizer
 
 jobs:
+  # The matrix is built here rather than filtered on the build job, because a
+  # job-level `if` cannot see the matrix context -- referencing matrix.leg
+  # there is a workflow error that kills the run with zero jobs.
+  setup:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+      count: ${{ steps.pick.outputs.count }}
+    steps:
+      - id: pick
+        env:
+          ONLY: ${{ inputs.only_legs }}
+        run: |
+          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          import json, os
+          legs = [
+            {"leg": "gcc-bootstrap",         "host": "gcc",   "make_target": "bootstrap",         "pgo": "no",  "train": ""},
+            {"leg": "gcc-profiledbootstrap", "host": "gcc",   "make_target": "profiledbootstrap", "pgo": "no",  "train": ""},
+            {"leg": "clang-plain",           "host": "clang", "make_target": "all",               "pgo": "no",  "train": ""},
+            {"leg": "clang-pgo",             "host": "clang", "make_target": "all",               "pgo": "yes", "train": "targetlibs"},
+            {"leg": "clang-pgo-gcctrain",    "host": "clang", "make_target": "all",               "pgo": "yes", "train": "gccsources"},
+          ]
+          only = (os.environ.get("ONLY") or "").split()
+          if only:
+              legs = [l for l in legs if l["leg"] in only]
+          print("matrix=" + json.dumps({"include": legs}))
+          print("count=%d" % len(legs))
+          PY
+          cat "$GITHUB_OUTPUT"
+
   build:
-    if: ${{ inputs.only_legs == '' || contains(format(' {0} ', inputs.only_legs), format(' {0} ', matrix.leg)) }}
+    needs: setup
+    if: ${{ needs.setup.outputs.count != '0' }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - leg: gcc-bootstrap
-            host: gcc
-            make_target: bootstrap
-            pgo: 'no'
-          - leg: gcc-profiledbootstrap
-            host: gcc
-            make_target: profiledbootstrap
-            pgo: 'no'
-          - leg: clang-plain
-            host: clang
-            make_target: all
-            pgo: 'no'
-          - leg: clang-pgo
-            host: clang
-            make_target: all
-            pgo: 'yes'
-            train: targetlibs
-          - leg: clang-pgo-gcctrain
-            host: clang
-            make_target: all
-            pgo: 'yes'
-            train: gccsources
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     runs-on: ubuntu-24.04
     container: rockylinux:8
     timeout-minutes: 350
