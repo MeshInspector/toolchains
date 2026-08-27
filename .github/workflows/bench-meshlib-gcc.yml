@@ -1,0 +1,345 @@
+name: Bench MeshLib build - distro g++-14 vs clang-PGO GCC
+
+# Does pointing our PGO clang at GCC speed up the compiler that actually
+# dominates MeshLib PR CI? ubuntu-x64-minimal-config.json is a single row --
+# ubuntu24 / Release / GCC / /usr/bin/g++-14 -- and that g++-14 comes from
+# ppa:ubuntu-toolchain-r/test, which is built profiledbootstrap-lean AND
+# bootstrap-lto-lean. So the distro baseline already has PGO plus LTO, unlike
+# the plain profiledbootstrap leg in the other bench.
+#
+# Legs:
+#   distro         /usr/bin/g++-14 exactly as MeshLib CI uses it
+#   clang-pgo      vanilla GCC of the SAME version, built by the PGO clang keg
+#                  with clang IR-PGO (trained on the target libs)
+#   clang-pgo-lto  same plus ThinLTO, to match what the distro build has
+#
+# The GCC version is read from the distro package, so the vanilla builds always
+# match it; distro patches remain a residual difference.
+#
+# Everything is timed in ONE job on ONE machine, interleaved, because hosted
+# x64 hands out a different CPU per job. The workload is MeshLib's own
+# build_source.sh with the ubuntu24 row's cmake options, target MRMesh
+# (304 TUs), from a wiped build dir each round so configure and PCH are
+# included exactly as a fresh CI run pays for them.
+
+on:
+  push:
+    branches: [ gcc14-clang22-probe ]
+    paths: [ '.github/workflows/bench-meshlib-gcc.yml' ]
+  workflow_dispatch:
+    inputs:
+      gcc_run_id:
+        description: 'Reuse the GCC install trees from this run id instead of building them'
+        required: false
+        default: ''
+      meshlib_ref:
+        description: 'MeshLib ref to build'
+        required: false
+        default: master
+
+env:
+  LLVM_VER: 22.1.8
+  KEG: /opt/llvm-pgo-dylib-22.1.8
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  build-gcc:
+    if: ${{ inputs.gcc_run_id == '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: clang-pgo
+            lto: 'no'
+          - leg: clang-pgo-lto
+            lto: 'yes'
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build deps
+        run: |
+          apt-get update -qq
+          apt-get install -qqy --no-install-recommends software-properties-common curl ca-certificates
+          add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          apt-get update -qq
+          apt-get install -qqy --no-install-recommends \
+            g++-14 make m4 wget xz-utils file patch perl python3 cmake ninja-build git \
+            libgmp-dev libmpfr-dev libmpc-dev zlib1g-dev binutils
+          g++-14 --version | head -n1
+          dpkg -s g++-14 | grep ^Version
+
+      - name: Install PGO clang keg
+        run: |
+          curl -fsSL "https://github.com/MeshInspector/toolchains/releases/download/clang-${LLVM_VER}-pgo-dylib-linux/clang-${LLVM_VER}-pgo-dylib-linux-$(uname -m).tar.gz" | tar -C /opt -xz
+          "${KEG}/bin/clang" --version | head -n1
+
+      # The keg ships no profile runtime (its cmake sets no LLVM_ENABLE_RUNTIMES),
+      # so -fprofile-generate cannot link until we build that one library.
+      - name: Provide clang profile runtime
+        run: |
+          RES=$("${KEG}/bin/clang" -print-resource-dir)
+          if ls "$RES"/lib/*/libclang_rt.profile*.a 2>/dev/null; then
+            echo "keg already ships it"
+          else
+            curl -fsSL -o llvm.tar.xz "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VER}/llvm-project-${LLVM_VER}.src.tar.xz"
+            tar -xf llvm.tar.xz
+            cmake -G Ninja -S "llvm-project-${LLVM_VER}.src/runtimes" -B crt \
+              -DCMAKE_C_COMPILER="${KEG}/bin/clang" \
+              -DCMAKE_CXX_COMPILER="${KEG}/bin/clang++" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DLLVM_ENABLE_RUNTIMES=compiler-rt \
+              -DCOMPILER_RT_BUILD_PROFILE=ON \
+              -DCOMPILER_RT_BUILD_BUILTINS=OFF \
+              -DCOMPILER_RT_BUILD_SANITIZERS=OFF \
+              -DCOMPILER_RT_BUILD_XRAY=OFF \
+              -DCOMPILER_RT_BUILD_LIBFUZZER=OFF \
+              -DCOMPILER_RT_BUILD_MEMPROF=OFF \
+              -DCOMPILER_RT_BUILD_ORC=OFF \
+              -DCOMPILER_RT_INCLUDE_TESTS=OFF
+            ninja -C crt
+            ARCH=$(uname -m)
+            mkdir -p "$RES/lib/linux" "$RES/lib/${ARCH}-unknown-linux-gnu"
+            for f in $(find crt -name 'libclang_rt.profile*.a'); do
+              cp -v "$f" "$RES/lib/linux/libclang_rt.profile-${ARCH}.a"
+              cp -v "$f" "$RES/lib/${ARCH}-unknown-linux-gnu/libclang_rt.profile.a"
+            done
+            rm -rf crt llvm.tar.xz "llvm-project-${LLVM_VER}.src"
+          fi
+          { echo 'int main(){ return 0; }'; } > /tmp/p.c
+          "${KEG}/bin/clang" -fprofile-generate /tmp/p.c -o /tmp/p
+          LLVM_PROFILE_FILE=/tmp/x.profraw /tmp/p
+          ls -la /tmp/x.profraw
+
+      # Version parity with the distro package, whatever the PPA currently ships
+      - name: Fetch matching GCC sources
+        run: |
+          GCC_VER=$(g++-14 -dumpfullversion)
+          echo "GCC_VER=${GCC_VER}" >> "$GITHUB_ENV"
+          echo "matching distro g++-14 upstream version: ${GCC_VER}"
+          curl -fsSL -o gcc.tar.xz "https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VER}/gcc-${GCC_VER}.tar.xz"
+          tar -xf gcc.tar.xz
+
+      - name: Instrument and train on the target libs
+        run: |
+          mkdir -p inst && cd inst
+          CC="${KEG}/bin/clang" CXX="${KEG}/bin/clang++" \
+          CFLAGS='-O2 -fprofile-generate' CXXFLAGS='-O2 -fprofile-generate' \
+          LDFLAGS='-fprofile-generate' \
+            "../gcc-${GCC_VER}/configure" --prefix=/opt/gcc14-inst \
+            --enable-languages=c,c++ --disable-multilib --disable-libsanitizer \
+            --disable-bootstrap CFLAGS_FOR_TARGET=-O2 CXXFLAGS_FOR_TARGET=-O2 > conf.log 2>&1 \
+            || { tail -30 conf.log; exit 1; }
+          mkdir -p /tmp/prof
+          LLVM_PROFILE_FILE='/tmp/prof/%4m.profraw' make -j"$(nproc)" all > make.log 2>&1 \
+            || { grep -nE 'error:|Error [0-9]' make.log | head -40; tail -30 make.log; exit 1; }
+          echo "profraw files: $(ls /tmp/prof | wc -l), $(du -sh /tmp/prof | cut -f1)"
+          "${KEG}/bin/llvm-profdata" merge -output=/tmp/gcc.profdata /tmp/prof/*.profraw
+          ls -la /tmp/gcc.profdata
+
+      - name: Final build
+        env:
+          LEG: ${{ matrix.leg }}
+          LTO: ${{ matrix.lto }}
+        run: |
+          PREFIX="/opt/gcc14-${LEG}"
+          OPT="-O2 -fprofile-use=/tmp/gcc.profdata"
+          LDF=""
+          if [ "$LTO" = yes ]; then
+            OPT="${OPT} -flto=thin"
+            LDF="-flto=thin -fuse-ld=lld --ld-path=${KEG}/bin/ld.lld"
+          fi
+          mkdir -p build && cd build
+          CC="${KEG}/bin/clang" CXX="${KEG}/bin/clang++" \
+          CFLAGS="$OPT" CXXFLAGS="$OPT" LDFLAGS="$LDF" \
+            "../gcc-${GCC_VER}/configure" --prefix="$PREFIX" \
+            --enable-languages=c,c++ --disable-multilib --disable-libsanitizer \
+            --disable-bootstrap CFLAGS_FOR_TARGET=-O2 CXXFLAGS_FOR_TARGET=-O2 > conf.log 2>&1 \
+            || { tail -40 conf.log; exit 1; }
+          SECONDS=0
+          make -j"$(nproc)" all > make.log 2>&1 \
+            || { grep -nE 'error:|Error [0-9]' make.log | head -40; tail -40 make.log; exit 1; }
+          BUILD_SECONDS=$SECONDS
+          make install > /dev/null
+          CC1PLUS=$(echo "$PREFIX"/libexec/gcc/*/*/cc1plus)
+          echo "leg=${LEG} gcc=${GCC_VER} build_seconds=${BUILD_SECONDS}" | tee "$PREFIX/BENCHMETA"
+          size "$CC1PLUS" | tee -a "$PREFIX/BENCHMETA"
+          readelf -p .comment "$CC1PLUS" | tee -a "$PREFIX/BENCHMETA"
+          "$PREFIX/bin/g++" --version | head -n1
+
+      - name: Pack and upload
+        run: tar -C /opt -czf "/tmp/gcctree-${{ matrix.leg }}.tar.gz" "gcc14-${{ matrix.leg }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gcctree-${{ matrix.leg }}
+          path: /tmp/gcctree-${{ matrix.leg }}.tar.gz
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gcclog-${{ matrix.leg }}
+          path: |
+            build/make.log
+            build/conf.log
+            inst/make.log
+          retention-days: 7
+          if-no-files-found: warn
+
+  bench:
+    needs: build-gcc
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04
+    timeout-minutes: 350
+    permissions:
+      actions: read
+      contents: read
+    env:
+      MR_STATE: DOCKER_BUILD
+      MESHLIB_BUILD_RELEASE: 'ON'
+      MESHLIB_BUILD_DEBUG: 'OFF'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install deps like the ubuntu24 image does
+        run: |
+          apt-get update -qq
+          apt-get install -qqy --no-install-recommends software-properties-common curl ca-certificates
+          add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          apt-get update -qq
+          apt-get install -qqy --no-install-recommends \
+            g++-14 gcc-14 git sudo time cmake ninja-build patchelf gettext gawk procps \
+            xz-utils unzip wget python3 pkg-config
+          g++-14 --version | head -n1
+          dpkg -s g++-14 | grep ^Version
+
+      - name: Checkout MeshLib
+        uses: actions/checkout@v4
+        with:
+          repository: MeshInspector/MeshLib
+          ref: ${{ inputs.meshlib_ref || 'master' }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install MeshLib apt requirements
+        run: ./scripts/install_apt_requirements.sh
+
+      - name: Download GCC trees (this run)
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gcctree-*
+          path: /tmp/trees
+          merge-multiple: true
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download GCC trees (reused run)
+        if: inputs.gcc_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gcctree-*
+          path: /tmp/trees
+          merge-multiple: true
+          run-id: ${{ inputs.gcc_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Unpack compilers
+        run: |
+          for t in /tmp/trees/*.tar.gz; do tar -C /opt -xzf "$t"; done
+          rm -rf /tmp/trees
+          { echo distro; ls -d /opt/gcc14-* 2>/dev/null | sed 's|/opt/gcc14-||'; } | tee /tmp/legs.txt
+          df -h / | tail -1
+
+      - name: Provenance
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          echo "nproc=$(nproc)"
+          echo "MeshLib $(git rev-parse --short HEAD)"
+          for leg in $(cat /tmp/legs.txt); do
+            echo "=== $leg"
+            if [ "$leg" = distro ]; then
+              /usr/bin/g++-14 --version | head -n1
+              readelf -p .comment /usr/libexec/gcc/x86_64-linux-gnu/14/cc1plus 2>/dev/null | head -6 || true
+            else
+              cat "/opt/gcc14-$leg/BENCHMETA"
+            fi
+          done
+
+      - name: Build thirdparty once
+        run: |
+          SECONDS=0
+          ./scripts/build_thirdparty.sh > /tmp/thirdparty.log 2>&1 \
+            || { tail -40 /tmp/thirdparty.log; exit 1; }
+          echo "thirdparty built in ${SECONDS}s with the distro compiler"
+
+      # MeshLib's own build path, only the compiler varies. Round 0 is a
+      # discarded warm-up; the build dir is wiped every round so configure and
+      # the precompiled headers are paid for each time, as in a fresh CI run.
+      - name: Interleaved timing of target MRMesh
+        run: |
+          : > /tmp/results.txt
+          for round in 0 1 2; do
+            for leg in $(cat /tmp/legs.txt); do
+              if [ "$leg" = distro ]; then
+                CXX=/usr/bin/g++-14; CC=/usr/bin/gcc-14; unset LD_LIBRARY_PATH
+              else
+                CXX="/opt/gcc14-$leg/bin/g++"; CC="/opt/gcc14-$leg/bin/gcc"
+                export LD_LIBRARY_PATH="/opt/gcc14-$leg/lib64"
+              fi
+              rm -rf build
+              t0=$(date +%s%N)
+              env CMAKE_C_COMPILER="$CC" CMAKE_CXX_COMPILER="$CXX" \
+                MR_CMAKE_BUILD_OPTIONS="--target MRMesh" \
+                MR_CMAKE_OPTIONS="-DMR_CXX_STANDARD=23 -DMESHLIB_BUILD_MRCUDA=OFF -DMR_PCH_USE_EXTRA_HEADERS=ON -DMESHLIB_BUILD_MRMESH_PY_LEGACY=OFF -DMESHLIB_BUILD_GENERATED_C_BINDINGS=OFF -DMRVIEWER_NO_XDG_DESKTOP_PORTAL=ON" \
+                ./scripts/build_source.sh > "/tmp/build-$leg-$round.log" 2>&1 \
+                || { tail -40 "/tmp/build-$leg-$round.log"; exit 1; }
+              t1=$(date +%s%N)
+              ms=$(( (t1 - t0) / 1000000 ))
+              echo "RESULT $round $leg mrmesh $ms" | tee -a /tmp/results.txt
+            done
+            echo "--- round $round done"
+          done
+
+      - name: Summarize
+        if: always()
+        run: |
+          awk '
+            $1=="RESULT" && $2>0 { k=$3; vals[k]=vals[k]" "$5 }
+            END {
+              for (k in vals) { n=split(vals[k],a," "); asort(a);
+                mn[k]=a[1]; md[k]=a[int((n+1)/2)] }
+              base=mn["distro"]
+              for (k in mn) {
+                d = base ? 100*(mn[k]-base)/base : 0
+                printf "| %s | %.1f | %.1f | %+.1f%% |\n", k, mn[k]/1000, md[k]/1000, d }
+            }' /tmp/results.txt | sort > /tmp/body.md
+          {
+            echo '## MeshLib target MRMesh, distro g++-14 vs clang-PGO GCC'
+            echo
+            grep -m1 'model name' /proc/cpuinfo
+            echo "MeshLib $(git rev-parse --short HEAD), nproc=$(nproc)"
+            echo
+            echo '| leg | min s | median s | vs distro g++-14 |'
+            echo '|---|---|---|---|'
+            cat /tmp/body.md
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload raw timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meshlib-timings
+          path: |
+            /tmp/results.txt
+            /tmp/build-*.log
+          retention-days: 30
+          if-no-files-found: warn
