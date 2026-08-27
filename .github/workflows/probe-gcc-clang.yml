@@ -119,22 +119,37 @@ jobs:
           tail -40 ../build.log
           exit $rc
 
+      # .comment accumulates one string per producer; the 8.5.0/13.3.1 entries
+      # are distro crt*.o. Asserted both ways: clang made cc1plus AND the new
+      # GCC did not. One statement per line -- -e ignores a failing lhs of &&.
       - name: Prove what compiled what
         run: |
           source /opt/rh/gcc-toolset-13/enable
           CC1PLUS=$(find build -name cc1plus | head -1)
           echo "cc1plus: $CC1PLUS"
-          readelf -p .comment "$CC1PLUS" | head -20
+          readelf -p .comment "$CC1PLUS" | tee cmt.txt
+          grep -q "clang version ${LLVM_VER}" cmt.txt
+          if grep -q "GCC: (GNU) 14" cmt.txt; then echo "FAIL: GCC-14-built objects in cc1plus"; exit 1; fi
+          {
+            echo '#include <print>'
+            echo '#include <vector>'
+            echo '#include <algorithm>'
+            echo 'int main(){ std::vector<int> v{3,1,2}; std::ranges::sort(v);'
+            echo '  std::println("cc1plus says: {}", __VERSION__);'
+            echo '  std::println("sorted: {}{}{}", v[0], v[1], v[2]); }'
+          } > t.cpp
+          cat t.cpp
           if [ '${{ matrix.make_target }}' = 'all' ]; then
             make -C build install > /dev/null
             /opt/gcc14/bin/g++ -v
-            printf '#include <format>\n#include <print>\nint main(){ std::print("{} {}\n", "gcc", __GNUC__); }\n' > t.cpp
-            /opt/gcc14/bin/g++ -std=c++23 t.cpp -o t && ./t
-            readelf -p .comment /opt/gcc14/libexec/gcc/*/*/cc1plus | head -20
+            readelf -p .comment /opt/gcc14/libexec/gcc/*/*/cc1plus
+            /opt/gcc14/bin/g++ -std=c++23 t.cpp -o t
+            ./t
           else
             build/gcc/xgcc --version
-            printf '#include <stdio.h>\nint main(){ puts("stage1 ok"); }\n' > t.c
-            build/gcc/xgcc -B build/gcc/ t.c -o t && ./t
+            { echo '#include <stdio.h>'; echo 'int main(){ puts("stage1 ok"); }'; } > t.c
+            build/gcc/xgcc -B build/gcc/ t.c -o t
+            ./t
           fi
 
       - name: Upload build log
