@@ -1,0 +1,149 @@
+name: Probe GCC built with clang PGO
+
+# Feasibility probe, not a product: can GCC 14 be built from sources by our PGO
+# clang 22 keg? Four legs on rockylinux:8 (glibc 2.28) vary ONLY the
+# clang-related knobs, so a failure names the knob that fixes it.
+#
+# Baseline flags shared by every leg (c,c++ / no multilib / no libsanitizer)
+# are GCC-vs-distro concerns, not clang ones, and are held constant.
+
+on:
+  push:
+    branches: [ gcc14-clang22-probe ]
+  workflow_dispatch:
+
+env:
+  GCC_VER: 14.3.0
+  LLVM_VER: 22.1.8
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # clang compiles the final compiler, nothing smoothed over
+          - leg: no-knobs-intree
+            prereq: intree
+            bootstrap: 'no'
+            conf_extra: ''
+            cflags: ''
+            make_target: all
+          # same, but gmp/mpfr/mpc come from RPMs instead of in-tree tarballs
+          - leg: no-knobs-sysdeps
+            prereq: system
+            bootstrap: 'no'
+            conf_extra: ''
+            cflags: ''
+            make_target: all
+          # every escape hatch I predicted would be needed
+          - leg: knobs-intree
+            prereq: intree
+            bootstrap: 'no'
+            conf_extra: '--disable-werror'
+            cflags: '-Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=implicit-int -Wno-error=incompatible-pointer-types'
+            make_target: all
+          # the macOS/BSD path: clang builds stage1 only, GCC builds the rest
+          - leg: stage1-bootstrap
+            prereq: system
+            bootstrap: 'yes'
+            conf_extra: '--disable-werror'
+            cflags: ''
+            make_target: stage1-bubble
+    runs-on: ubuntu-24.04
+    container: rockylinux:8
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build deps
+        run: |
+          echo "install_weak_deps=false" >> /etc/dnf/dnf.conf
+          dnf -y install 'dnf-command(config-manager)'
+          dnf config-manager --set-enabled powertools
+          dnf -y install gcc-toolset-13-gcc-c++ make m4 wget curl tar xz bzip2 gzip \
+            diffutils file perl patch which zlib-devel glibc-devel binutils elfutils-libelf-devel
+
+      - name: Install system gmp/mpfr/mpc
+        if: matrix.prereq == 'system'
+        run: dnf -y install gmp-devel mpfr-devel libmpc-devel
+
+      - name: Install PGO clang keg
+        run: |
+          curl -fsSL "https://github.com/MeshInspector/toolchains/releases/download/clang-${LLVM_VER}-pgo-dylib-linux/clang-${LLVM_VER}-pgo-dylib-linux-$(uname -m).tar.gz" | tar -C /opt -xz
+          "/opt/llvm-pgo-dylib-${LLVM_VER}/bin/clang" --version
+
+      - name: Fetch GCC sources
+        run: |
+          curl -fsSL -o gcc.tar.xz "https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VER}/gcc-${GCC_VER}.tar.xz"
+          tar -xf gcc.tar.xz
+
+      - name: Download in-tree prerequisites
+        if: matrix.prereq == 'intree'
+        run: cd "gcc-${GCC_VER}" && ./contrib/download_prerequisites
+
+      - name: Configure
+        env:
+          CONF_EXTRA: ${{ matrix.conf_extra }}
+          EXTRA_CFLAGS: ${{ matrix.cflags }}
+          BOOTSTRAP: ${{ matrix.bootstrap }}
+        run: |
+          source /opt/rh/gcc-toolset-13/enable
+          export CC="/opt/llvm-pgo-dylib-${LLVM_VER}/bin/clang"
+          export CXX="/opt/llvm-pgo-dylib-${LLVM_VER}/bin/clang++"
+          if [ -n "$EXTRA_CFLAGS" ]; then
+            export CFLAGS="-O2 $EXTRA_CFLAGS" CXXFLAGS="-O2 $EXTRA_CFLAGS"
+            # target libs are built by the new xgcc, keep clang flags out of them
+            export CFLAGS_FOR_TARGET="-O2" CXXFLAGS_FOR_TARGET="-O2"
+          fi
+          if [ "$BOOTSTRAP" = 'yes' ]; then BOOT=--enable-bootstrap; else BOOT=--disable-bootstrap; fi
+          mkdir -p build && cd build
+          "../gcc-${GCC_VER}/configure" --prefix=/opt/gcc14 \
+            --enable-languages=c,c++ --disable-multilib --disable-libsanitizer \
+            $BOOT $CONF_EXTRA 2>&1 | tee ../configure.log
+
+      - name: Build
+        env:
+          MAKE_TARGET: ${{ matrix.make_target }}
+        run: |
+          source /opt/rh/gcc-toolset-13/enable
+          cd build
+          set +e
+          time make -j"$(nproc)" "$MAKE_TARGET" > ../build.log 2>&1
+          rc=$?
+          set -e
+          echo "make exit code: $rc  ($(wc -l < ../build.log) log lines)"
+          grep -nE "error:|Error [0-9]+|fatal error|\*\*\*" ../build.log | head -60 || true
+          echo '--- tail ---'
+          tail -40 ../build.log
+          exit $rc
+
+      - name: Prove what compiled what
+        run: |
+          source /opt/rh/gcc-toolset-13/enable
+          CC1PLUS=$(find build -name cc1plus | head -1)
+          echo "cc1plus: $CC1PLUS"
+          readelf -p .comment "$CC1PLUS" | head -20
+          if [ '${{ matrix.make_target }}' = 'all' ]; then
+            make -C build install > /dev/null
+            /opt/gcc14/bin/g++ -v
+            printf '#include <format>\n#include <print>\nint main(){ std::print("{} {}\n", "gcc", __GNUC__); }\n' > t.cpp
+            /opt/gcc14/bin/g++ -std=c++23 t.cpp -o t && ./t
+            readelf -p .comment /opt/gcc14/libexec/gcc/*/*/cc1plus | head -20
+          else
+            build/gcc/xgcc --version
+            printf '#include <stdio.h>\nint main(){ puts("stage1 ok"); }\n' > t.c
+            build/gcc/xgcc -B build/gcc/ t.c -o t && ./t
+          fi
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-${{ matrix.leg }}
+          path: |
+            build.log
+            configure.log
+          retention-days: 7
+          if-no-files-found: warn
