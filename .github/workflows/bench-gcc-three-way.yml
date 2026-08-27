@@ -221,7 +221,9 @@ jobs:
       - name: Install deps
         run: |
           echo "install_weak_deps=false" >> /etc/dnf/dnf.conf
-          dnf -y install make curl tar gzip gawk binutils findutils diffutils glibc-devel
+          dnf -y install 'dnf-command(config-manager)'
+          dnf config-manager --set-enabled powertools
+          dnf -y install make curl tar gzip gawk binutils findutils diffutils glibc-devel             gmp mpfr libmpc
 
       - name: Download install trees
         uses: actions/download-artifact@v4
@@ -307,12 +309,16 @@ jobs:
           cd /tmp/w
           for leg in $(cat /tmp/legs.txt); do
             GXX="/opt/gcc14-$leg/bin/g++"
-            H1=$($GXX -O2 -std=c++20 -S -o - stl.cpp | sha256sum | cut -d' ' -f1)
+            H1=$($GXX -O2 -std=c++23 -S -o - stl.cpp | sha256sum | cut -d' ' -f1)
             H2=$($GXX -O2 -std=c++17 -I eigen-3.4.0 -S -o - eigen.cpp | sha256sum | cut -d' ' -f1)
             echo "$leg stl=$H1 eigen=$H2" | tee -a /tmp/hashes.txt
           done
           test "$(awk '{print $2, $3}' /tmp/hashes.txt | sort -u | wc -l)" = 1
           echo "asm identical across all legs"
+          for leg in $(cat /tmp/legs.txt); do
+            "/opt/gcc14-$leg/bin/g++" -O2 -std=c++23               -Wl,-rpath,"/opt/gcc14-$leg/lib64" stl.cpp -o "/tmp/run-$leg"
+            echo "$leg runs: $("/tmp/run-$leg")"
+          done
 
       - name: Interleaved timing
         run: |
@@ -323,7 +329,7 @@ jobs:
             local gxx=$1 wl=$2 n=$3
             rm -rf /tmp/o && mkdir -p /tmp/o
             if [ "$wl" = stl ]; then
-              seq 1 "$n" | xargs -P "$J" -I@ "$gxx" -O2 -std=c++20 -c stl.cpp -o /tmp/o/@.o
+              seq 1 "$n" | xargs -P "$J" -I@ "$gxx" -O2 -std=c++23 -c stl.cpp -o /tmp/o/@.o
             else
               seq 1 "$n" | xargs -P "$J" -I@ "$gxx" -O2 -std=c++17 -I eigen-3.4.0 -c eigen.cpp -o /tmp/o/@.o
             fi

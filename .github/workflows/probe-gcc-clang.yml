@@ -144,7 +144,7 @@ jobs:
             make -C build install > /dev/null
             /opt/gcc14/bin/g++ -v
             readelf -p .comment /opt/gcc14/libexec/gcc/*/*/cc1plus
-            /opt/gcc14/bin/g++ -std=c++23 t.cpp -o t
+            /opt/gcc14/bin/g++ -std=c++23 -Wl,-rpath,/opt/gcc14/lib64 t.cpp -o t
             ./t
           else
             build/gcc/xgcc --version
