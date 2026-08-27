@@ -1,0 +1,383 @@
+name: Bench GCC build recipes
+
+# Three-way (plus one) timing comparison of GCC 14.3.0 built four ways, to
+# answer whether pointing our PGO clang at GCC buys anything:
+#   gcc-bootstrap          plain 3-stage bootstrap, the conventional build
+#   gcc-profiledbootstrap  GCC's own self-PGO, what distros already ship
+#   clang-plain            --disable-bootstrap, compiled by the PGO clang keg
+#   clang-pgo              same, plus hand-rolled clang IR-PGO of cc1plus
+#
+# Hosted x64 hands out a different CPU per job, so timings from separate jobs
+# are not comparable. The four compilers are therefore built in parallel jobs,
+# shipped as artifacts, and ALL timed in one single-machine job, interleaved.
+#
+# Every leg is -O2 with no -g for both host and target code, so the only
+# variable is which compiler produced cc1plus and with what profile data.
+
+on:
+  push:
+    branches: [ gcc14-clang22-probe ]
+    paths: [ '.github/workflows/bench-gcc-three-way.yml' ]
+  workflow_dispatch:
+
+env:
+  GCC_VER: 14.3.0
+  LLVM_VER: 22.1.8
+  KEG: /opt/llvm-pgo-dylib-22.1.8
+  COMMON_CONF: --enable-languages=c,c++ --disable-multilib --disable-libsanitizer
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: gcc-bootstrap
+            host: gcc
+            make_target: bootstrap
+            pgo: 'no'
+          - leg: gcc-profiledbootstrap
+            host: gcc
+            make_target: profiledbootstrap
+            pgo: 'no'
+          - leg: clang-plain
+            host: clang
+            make_target: all
+            pgo: 'no'
+          - leg: clang-pgo
+            host: clang
+            make_target: all
+            pgo: 'yes'
+    runs-on: ubuntu-24.04
+    container: rockylinux:8
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build deps
+        run: |
+          echo "install_weak_deps=false" >> /etc/dnf/dnf.conf
+          dnf -y install 'dnf-command(config-manager)'
+          dnf config-manager --set-enabled powertools
+          dnf -y install gcc-toolset-13-gcc-c++ make m4 wget curl tar xz bzip2 gzip \
+            diffutils file perl patch which zlib-devel glibc-devel binutils \
+            gmp-devel mpfr-devel libmpc-devel
+
+      - name: Install PGO clang keg
+        if: matrix.host == 'clang'
+        run: |
+          curl -fsSL "https://github.com/MeshInspector/toolchains/releases/download/clang-${LLVM_VER}-pgo-dylib-linux/clang-${LLVM_VER}-pgo-dylib-linux-$(uname -m).tar.gz" | tar -C /opt -xz
+          "${KEG}/bin/clang" --version
+
+      # The keg's final cmake sets no LLVM_ENABLE_RUNTIMES, so it ships no
+      # profile runtime and -fprofile-generate cannot link. Build just that one
+      # library from the matching LLVM sources and drop it in both resource-dir
+      # layouts, then prove instrumentation works before the long build.
+      - name: Provide clang profile runtime (clang-pgo only)
+        if: matrix.pgo == 'yes'
+        run: |
+          RES=$("${KEG}/bin/clang" -print-resource-dir)
+          echo "resource dir: $RES"
+          if ls "$RES"/lib/*/libclang_rt.profile*.a 2>/dev/null; then
+            echo "keg already ships the profile runtime"
+          else
+            dnf -y install cmake ninja-build python3.12
+            curl -fsSL -o llvm.tar.xz "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VER}/llvm-project-${LLVM_VER}.src.tar.xz"
+            tar -xf llvm.tar.xz
+            cmake -G Ninja -S "llvm-project-${LLVM_VER}.src/runtimes" -B crt \
+              -DCMAKE_C_COMPILER="${KEG}/bin/clang" \
+              -DCMAKE_CXX_COMPILER="${KEG}/bin/clang++" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DLLVM_ENABLE_RUNTIMES=compiler-rt \
+              -DCOMPILER_RT_BUILD_PROFILE=ON \
+              -DCOMPILER_RT_BUILD_BUILTINS=OFF \
+              -DCOMPILER_RT_BUILD_SANITIZERS=OFF \
+              -DCOMPILER_RT_BUILD_XRAY=OFF \
+              -DCOMPILER_RT_BUILD_LIBFUZZER=OFF \
+              -DCOMPILER_RT_BUILD_MEMPROF=OFF \
+              -DCOMPILER_RT_BUILD_ORC=OFF \
+              -DCOMPILER_RT_INCLUDE_TESTS=OFF
+            ninja -C crt
+            ARCH=$(uname -m)
+            mkdir -p "$RES/lib/linux" "$RES/lib/${ARCH}-unknown-linux-gnu"
+            for f in $(find crt -name 'libclang_rt.profile*.a'); do
+              cp -v "$f" "$RES/lib/linux/libclang_rt.profile-${ARCH}.a"
+              cp -v "$f" "$RES/lib/${ARCH}-unknown-linux-gnu/libclang_rt.profile.a"
+            done
+            rm -rf crt llvm.tar.xz "llvm-project-${LLVM_VER}.src"
+          fi
+          { echo 'int main(){ return 0; }'; } > /tmp/p.c
+          "${KEG}/bin/clang" -fprofile-generate /tmp/p.c -o /tmp/p
+          LLVM_PROFILE_FILE=/tmp/x.profraw /tmp/p
+          ls -la /tmp/x.profraw
+          echo "instrumentation verified end to end"
+
+      - name: Fetch GCC sources
+        run: |
+          curl -fsSL -o gcc.tar.xz "https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VER}/gcc-${GCC_VER}.tar.xz"
+          tar -xf gcc.tar.xz
+
+      # The instrumented cc1plus trains itself: building libgcc + libstdc++ with
+      # it IS the C++ workload, so no separate training corpus is needed.
+      - name: Instrument and train (clang-pgo only)
+        if: matrix.pgo == 'yes'
+        run: |
+          source /opt/rh/gcc-toolset-13/enable
+          mkdir -p inst && cd inst
+          CC="${KEG}/bin/clang" CXX="${KEG}/bin/clang++" \
+          CFLAGS='-O2 -fprofile-generate' CXXFLAGS='-O2 -fprofile-generate' \
+          LDFLAGS='-fprofile-generate' \
+            "../gcc-${GCC_VER}/configure" --prefix=/opt/gcc14-inst $COMMON_CONF \
+            --disable-bootstrap CFLAGS_FOR_TARGET=-O2 CXXFLAGS_FOR_TARGET=-O2 > conf.log 2>&1 \
+            || { tail -30 conf.log; exit 1; }
+          mkdir -p /tmp/prof
+          LLVM_PROFILE_FILE='/tmp/prof/%4m.profraw' make -j"$(nproc)" all > make.log 2>&1 \
+            || { grep -nE 'error:|Error [0-9]' make.log | head -40; tail -30 make.log; exit 1; }
+          ls -la /tmp/prof/
+          "${KEG}/bin/llvm-profdata" merge -output=/tmp/gcc.profdata /tmp/prof/*.profraw
+          ls -la /tmp/gcc.profdata
+
+      - name: Build
+        env:
+          LEG: ${{ matrix.leg }}
+          HOST: ${{ matrix.host }}
+          MAKE_TARGET: ${{ matrix.make_target }}
+          PGO: ${{ matrix.pgo }}
+        run: |
+          source /opt/rh/gcc-toolset-13/enable
+          PREFIX="/opt/gcc14-${LEG}"
+          MAKE_ARGS=()
+          if [ "$HOST" = clang ]; then
+            export CC="${KEG}/bin/clang" CXX="${KEG}/bin/clang++"
+            export CFLAGS='-O2' CXXFLAGS='-O2'
+            if [ "$PGO" = yes ]; then
+              export CFLAGS="-O2 -fprofile-use=/tmp/gcc.profdata"
+              export CXXFLAGS="-O2 -fprofile-use=/tmp/gcc.profdata"
+            fi
+            BOOT=--disable-bootstrap
+          else
+            export CC=gcc CXX=g++
+            BOOT=--enable-bootstrap
+            MAKE_ARGS=(BOOT_CFLAGS=-O2 BOOT_CXXFLAGS=-O2)
+          fi
+          mkdir -p build && cd build
+          "../gcc-${GCC_VER}/configure" --prefix="$PREFIX" $COMMON_CONF $BOOT \
+            CFLAGS_FOR_TARGET=-O2 CXXFLAGS_FOR_TARGET=-O2 > conf.log 2>&1 \
+            || { tail -40 conf.log; exit 1; }
+          SECONDS=0
+          make -j"$(nproc)" "${MAKE_ARGS[@]}" "$MAKE_TARGET" > make.log 2>&1 \
+            || { grep -nE 'error:|Error [0-9]' make.log | head -40; tail -40 make.log; exit 1; }
+          BUILD_SECONDS=$SECONDS
+          make install > /dev/null
+          CC1PLUS=$(echo "$PREFIX"/libexec/gcc/*/*/cc1plus)
+          echo "leg=${LEG} build_seconds=${BUILD_SECONDS} cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)" | tee "$PREFIX/BENCHMETA"
+          size "$CC1PLUS" | tee -a "$PREFIX/BENCHMETA"
+          readelf -p .comment "$CC1PLUS" | tee -a "$PREFIX/BENCHMETA"
+          echo "make took ${BUILD_SECONDS}s"
+
+      - name: Pack install tree
+        run: tar -C /opt -czf "/tmp/tree-${{ matrix.leg }}.tar.gz" "gcc14-${{ matrix.leg }}"
+
+      - name: Upload install tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: tree-${{ matrix.leg }}
+          path: /tmp/tree-${{ matrix.leg }}.tar.gz
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildlog-${{ matrix.leg }}
+          path: |
+            build/make.log
+            build/conf.log
+            inst/make.log
+          retention-days: 7
+          if-no-files-found: warn
+
+  bench:
+    needs: build
+    if: always()
+    runs-on: ubuntu-24.04
+    container: rockylinux:8
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install deps
+        run: |
+          echo "install_weak_deps=false" >> /etc/dnf/dnf.conf
+          dnf -y install make curl tar gzip gawk coreutils binutils findutils diffutils glibc-devel
+
+      - name: Download install trees
+        uses: actions/download-artifact@v4
+        with:
+          pattern: tree-*
+          path: /tmp/trees
+          merge-multiple: true
+
+      - name: Unpack compilers
+        run: |
+          for t in /tmp/trees/*.tar.gz; do tar -C /opt -xzf "$t"; done
+          rm -rf /tmp/trees
+          ls -d /opt/gcc14-* | sed 's|/opt/gcc14-||' | tee /tmp/legs.txt
+          df -h /opt | tail -1
+
+      - name: Machine and provenance
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          echo "nproc=$(nproc)"
+          for leg in $(cat /tmp/legs.txt); do
+            echo "=== $leg"
+            cat "/opt/gcc14-$leg/BENCHMETA"
+          done
+
+      - name: Generate workloads
+        run: |
+          mkdir -p /tmp/w && cd /tmp/w
+          curl -fsSL -o eigen.tar.gz "https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz"
+          tar -xzf eigen.tar.gz
+          {
+            echo '#include <algorithm>'
+            echo '#include <format>'
+            echo '#include <functional>'
+            echo '#include <map>'
+            echo '#include <memory>'
+            echo '#include <numeric>'
+            echo '#include <optional>'
+            echo '#include <print>'
+            echo '#include <random>'
+            echo '#include <ranges>'
+            echo '#include <regex>'
+            echo '#include <set>'
+            echo '#include <sstream>'
+            echo '#include <unordered_map>'
+            echo '#include <variant>'
+            echo '#include <vector>'
+            echo 'template <class T> struct Bag {'
+            echo '  std::vector<T> v; std::map<std::string, T> m;'
+            echo '  std::unordered_map<std::string, std::vector<T>> u;'
+            echo '  auto sorted() const { auto c = v; std::ranges::sort(c); return c; }'
+            echo '  std::string joined() const { std::ostringstream os;'
+            echo '    for (auto&& x : v | std::views::filter([](const T& y){ return y == y; })) os << x << 44;'
+            echo '    return os.str(); } };'
+            echo 'template struct Bag<int>;'
+            echo 'template struct Bag<double>;'
+            echo 'template struct Bag<std::string>;'
+            echo 'static std::regex re(R"((a+)(b*)c?)");'
+            echo 'int main(){ Bag<int> b; b.v = {3,1,2}; std::println("{}", b.joined());'
+            echo '  std::variant<int, std::string> vt = 1;'
+            echo '  return b.sorted().front() + (int)vt.index() + (int)re.mark_count(); }'
+          } > stl.cpp
+          {
+            echo '#include <Eigen/Dense>'
+            echo '#include <Eigen/Geometry>'
+            echo 'using namespace Eigen;'
+            echo 'template <class M> double work(const M& a) {'
+            echo '  JacobiSVD<M> svd(a, ComputeFullU | ComputeFullV);'
+            echo '  ColPivHouseholderQR<M> qr(a);'
+            echo '  FullPivLU<M> lu(a);'
+            echo '  return svd.singularValues().sum() + lu.determinant() + qr.rank(); }'
+            echo 'int main(){ MatrixXd a = MatrixXd::Random(8,8);'
+            echo '  Matrix<double,6,6> b = Matrix<double,6,6>::Random();'
+            echo '  return (int)(work(a) + work(b)); }'
+          } > eigen.cpp
+          wc -l stl.cpp eigen.cpp
+
+      # Same source + same GCC version must give byte-identical asm whatever
+      # compiled cc1plus; a mismatch would mean one of these compilers is wrong.
+      - name: Codegen identity across legs
+        run: |
+          cd /tmp/w
+          for leg in $(cat /tmp/legs.txt); do
+            GXX="/opt/gcc14-$leg/bin/g++"
+            H1=$($GXX -O2 -std=c++20 -S -o - stl.cpp | sha256sum | cut -d' ' -f1)
+            H2=$($GXX -O2 -std=c++17 -I eigen-3.4.0 -S -o - eigen.cpp | sha256sum | cut -d' ' -f1)
+            echo "$leg stl=$H1 eigen=$H2" | tee -a /tmp/hashes.txt
+          done
+          test "$(awk '{print $2, $3}' /tmp/hashes.txt | sort -u | wc -l)" = 1
+          echo "asm identical across all legs"
+
+      - name: Interleaved timing
+        run: |
+          cd /tmp/w
+          J=$(nproc)
+          : > /tmp/results.txt
+          run_wl() {
+            local gxx=$1 wl=$2 n=$3
+            rm -rf /tmp/o && mkdir -p /tmp/o
+            if [ "$wl" = stl ]; then
+              seq 1 "$n" | xargs -P "$J" -I@ "$gxx" -O2 -std=c++20 -c stl.cpp -o /tmp/o/@.o
+            else
+              seq 1 "$n" | xargs -P "$J" -I@ "$gxx" -O2 -std=c++17 -I eigen-3.4.0 -c eigen.cpp -o /tmp/o/@.o
+            fi
+          }
+          for round in 0 1 2 3 4 5; do
+            for leg in $(cat /tmp/legs.txt); do
+              for wl in stl eigen; do
+                case "$wl" in
+                  stl) n=16 ;;
+                  eigen) n=8 ;;
+                esac
+                t0=$(date +%s%N)
+                run_wl "/opt/gcc14-$leg/bin/g++" "$wl" "$n"
+                t1=$(date +%s%N)
+                ms=$(( (t1 - t0) / 1000000 ))
+                echo "RESULT $round $leg $wl $ms" | tee -a /tmp/results.txt
+              done
+            done
+            echo "--- round $round done (round 0 is a discarded warm-up)"
+          done
+
+      - name: Summarize
+        if: always()
+        run: |
+          awk '
+            $1=="RESULT" && $2>0 { k=$4" "$3; vals[k]=vals[k]" "$5 }
+            END {
+              for (k in vals) { n=split(vals[k],a," "); asort(a);
+                mn[k]=a[1]; md[k]=a[int((n+1)/2)] }
+              for (k in mn) { split(k,p," ");
+                if (p[2]=="gcc-bootstrap") base[p[1]]=mn[k] }
+              for (k in mn) { split(k,p," ");
+                d = base[p[1]] ? 100*(mn[k]-base[p[1]])/base[p[1]] : 0
+                printf "| %s | %s | %.2f | %.2f | %+.1f%% |\n", p[1], p[2], mn[k]/1000, md[k]/1000, d }
+            }' /tmp/results.txt | sort > /tmp/body.md
+          {
+            echo '## GCC 14.3.0 compile speed, four build recipes, one machine'
+            echo
+            grep -m1 'model name' /proc/cpuinfo
+            echo
+            echo '| workload | leg | min s | median s | vs bootstrap |'
+            echo '|---|---|---|---|---|'
+            cat /tmp/body.md
+            echo
+            echo '### Build cost'
+            echo '| leg | make seconds |'
+            echo '|---|---|'
+            for leg in $(cat /tmp/legs.txt); do
+              s=$(sed -n 's/.*build_seconds=\([0-9]*\).*/\1/p' "/opt/gcc14-$leg/BENCHMETA")
+              echo "| $leg | $s |"
+            done
+            echo
+            echo '### Codegen'
+            echo '```'
+            cat /tmp/hashes.txt
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload raw timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: timings
+          path: |
+            /tmp/results.txt
+            /tmp/hashes.txt
+          retention-days: 30
+          if-no-files-found: warn

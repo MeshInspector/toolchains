@@ -10,6 +10,7 @@ name: Probe GCC built with clang PGO
 on:
   push:
     branches: [ gcc14-clang22-probe ]
+    paths: [ '.github/workflows/probe-gcc-clang.yml' ]
   workflow_dispatch:
 
 env:
