@@ -149,8 +149,8 @@ jobs:
           OPT="-O2 -fprofile-use=/tmp/gcc.profdata"
           LDF=""
           if [ "$LTO" = yes ]; then
-            OPT="${OPT} -flto=thin"
-            LDF="-flto=thin -fuse-ld=lld --ld-path=${KEG}/bin/ld.lld"
+            OPT="${OPT} -flto=thin -ffat-lto-objects"
+            LDF="-flto=thin --ld-path=${KEG}/bin/ld.lld"
           fi
           mkdir -p build && cd build
           CC="${KEG}/bin/clang" CXX="${KEG}/bin/clang++" \
@@ -261,6 +261,7 @@ jobs:
 
       - name: Provenance
         run: |
+          git config --global --add safe.directory '*'
           grep -m1 'model name' /proc/cpuinfo
           echo "nproc=$(nproc)"
           echo "MeshLib $(git rev-parse --short HEAD)"
