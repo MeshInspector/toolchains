@@ -24,7 +24,11 @@ on:
   workflow_dispatch:
     inputs:
       trees_run_id:
-        description: 'Reuse the install trees from this run id instead of rebuilding'
+        description: 'Additionally download install trees from this run id'
+        required: false
+        default: ''
+      only_legs:
+        description: 'Build only these legs (space separated); empty means all'
         required: false
         default: ''
 
@@ -36,7 +40,7 @@ env:
 
 jobs:
   build:
-    if: ${{ !inputs.trees_run_id }}
+    if: ${{ inputs.only_legs == '' || contains(format(' {0} ', inputs.only_legs), format(' {0} ', matrix.leg)) }}
     strategy:
       fail-fast: false
       matrix:
@@ -179,7 +183,7 @@ jobs:
             echo "train build took ${SECONDS}s"
             grep -cE 'gcc14-inst/bin/(gcc|g\+\+)' make.log || true
           fi
-          ls -la /tmp/prof/ | head
+          echo "profraw files: $(ls /tmp/prof | wc -l), $(du -sh /tmp/prof | cut -f1)"
           "${KEG}/bin/llvm-profdata" merge -output=/tmp/gcc.profdata /tmp/prof/*.profraw
           ls -la /tmp/gcc.profdata
 
@@ -265,13 +269,24 @@ jobs:
           dnf config-manager --set-enabled powertools
           dnf -y install make curl tar gzip gawk binutils findutils diffutils glibc-devel             gmp mpfr libmpc
 
-      - name: Download install trees
+      - name: Download install trees (this run)
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           pattern: tree-*
           path: /tmp/trees
           merge-multiple: true
-          run-id: ${{ inputs.trees_run_id || github.run_id }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download install trees (reused run)
+        if: inputs.trees_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          pattern: tree-*
+          path: /tmp/trees
+          merge-multiple: true
+          run-id: ${{ inputs.trees_run_id }}
           github-token: ${{ github.token }}
 
       - name: Unpack compilers
