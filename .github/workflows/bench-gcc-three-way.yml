@@ -5,7 +5,10 @@ name: Bench GCC build recipes
 #   gcc-bootstrap          plain 3-stage bootstrap, the conventional build
 #   gcc-profiledbootstrap  GCC's own self-PGO, what distros already ship
 #   clang-plain            --disable-bootstrap, compiled by the PGO clang keg
-#   clang-pgo              same, plus hand-rolled clang IR-PGO of cc1plus
+#   clang-pgo              same, plus clang IR-PGO trained on the target libs
+#   clang-pgo-gcctrain     same, but trained on GCC's own sources + target
+#                          libs, i.e. profiledbootstrap's own stage-train
+#                          corpus, so the two PGO schemes are comparable
 #
 # Hosted x64 hands out a different CPU per job, so timings from separate jobs
 # are not comparable. The four compilers are therefore built in parallel jobs,
@@ -54,6 +57,12 @@ jobs:
             host: clang
             make_target: all
             pgo: 'yes'
+            train: targetlibs
+          - leg: clang-pgo-gcctrain
+            host: clang
+            make_target: all
+            pgo: 'yes'
+            train: gccsources
     runs-on: ubuntu-24.04
     container: rockylinux:8
     timeout-minutes: 350
@@ -124,10 +133,18 @@ jobs:
           curl -fsSL -o gcc.tar.xz "https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VER}/gcc-${GCC_VER}.tar.xz"
           tar -xf gcc.tar.xz
 
-      # The instrumented cc1plus trains itself: building libgcc + libstdc++ with
-      # it IS the C++ workload, so no separate training corpus is needed.
-      - name: Instrument and train (clang-pgo only)
+      # Two training corpora, because the corpus is a confound:
+      #   targetlibs  - what the instrumented compiler builds anyway (libgcc,
+      #                 libstdc++, libgomp...). Free, but template-heavy C++
+      #                 that resembles the benchmark workloads.
+      #   gccsources  - what profiledbootstrap's stage-train actually uses:
+      #                 GCC's own host sources AND the target libs. Needs the
+      #                 instrumented compiler installed, then a second tree
+      #                 configured with it as CC/CXX. Costs an extra build.
+      - name: Instrument and train (clang PGO legs)
         if: matrix.pgo == 'yes'
+        env:
+          TRAIN: ${{ matrix.train }}
         run: |
           source /opt/rh/gcc-toolset-13/enable
           mkdir -p inst && cd inst
@@ -138,9 +155,31 @@ jobs:
             --disable-bootstrap CFLAGS_FOR_TARGET=-O2 CXXFLAGS_FOR_TARGET=-O2 > conf.log 2>&1 \
             || { tail -30 conf.log; exit 1; }
           mkdir -p /tmp/prof
-          LLVM_PROFILE_FILE='/tmp/prof/%4m.profraw' make -j"$(nproc)" all > make.log 2>&1 \
-            || { grep -nE 'error:|Error [0-9]' make.log | head -40; tail -30 make.log; exit 1; }
-          ls -la /tmp/prof/
+          if [ "$TRAIN" = targetlibs ]; then
+            LLVM_PROFILE_FILE='/tmp/prof/%4m.profraw' make -j"$(nproc)" all > make.log 2>&1 \
+              || { grep -nE 'error:|Error [0-9]' make.log | head -40; tail -30 make.log; exit 1; }
+          else
+            # profiles from building the instrumented compiler itself are not
+            # the corpus -- throw them away, then train deliberately
+            LLVM_PROFILE_FILE='/tmp/junk/%4m.profraw' make -j"$(nproc)" all > make.log 2>&1 \
+              || { grep -nE 'error:|Error [0-9]' make.log | head -40; tail -30 make.log; exit 1; }
+            make install > /dev/null
+            cd ..
+            rm -rf /tmp/junk
+            mkdir -p train && cd train
+            export LD_LIBRARY_PATH=/opt/gcc14-inst/lib64
+            export LLVM_PROFILE_FILE='/tmp/prof/%4m.profraw'
+            CC=/opt/gcc14-inst/bin/gcc CXX=/opt/gcc14-inst/bin/g++ \
+              "../gcc-${GCC_VER}/configure" --prefix=/opt/gcc14-train $COMMON_CONF \
+              --disable-bootstrap CFLAGS_FOR_TARGET=-O2 CXXFLAGS_FOR_TARGET=-O2 > conf.log 2>&1 \
+              || { tail -30 conf.log; exit 1; }
+            SECONDS=0
+            make -j"$(nproc)" all > make.log 2>&1 \
+              || { grep -nE 'error:|Error [0-9]' make.log | head -40; tail -30 make.log; exit 1; }
+            echo "train build took ${SECONDS}s"
+            grep -cE 'gcc14-inst/bin/(gcc|g\+\+)' make.log || true
+          fi
+          ls -la /tmp/prof/ | head
           "${KEG}/bin/llvm-profdata" merge -output=/tmp/gcc.profdata /tmp/prof/*.profraw
           ls -la /tmp/gcc.profdata
 
@@ -202,6 +241,7 @@ jobs:
             build/make.log
             build/conf.log
             inst/make.log
+            train/make.log
           retention-days: 7
           if-no-files-found: warn
 
