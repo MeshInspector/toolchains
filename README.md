@@ -204,8 +204,8 @@ runs exactly the commands above.
 
 ## Who consumes these
 
-- `docker/rockylinux8-vcpkgDockerfile` in both MeshLib and MeshInspectorCode
-  fetches the Linux dylib keg into `/opt`. The version is pinned by the single
+- `docker/rockylinux8-vcpkgDockerfile` in our Linux images fetches the Linux
+  dylib keg into `/opt`. The version is pinned by the single
   `TOOLCHAIN=` line there, plus one `LLVM_PREFIX` env per workflow.
 - MeshLib `.github/workflows/build-test-macos.yml` and `pip-build.yml` install the
   macOS kegs on the GitHub-hosted runners through the composite action and use
