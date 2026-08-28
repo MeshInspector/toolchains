@@ -2,11 +2,16 @@ name: Build ld64.lld for macOS
 
 # Homebrew stopped bottling `lld` for Intel macOS when it became a Tier 3 configuration,
 # and neither our llvm-pgo keg nor the bottled llvm@22 contains ld64.lld, so the linker of
-# the MeshLib bindings is built here and published as a standalone binary for both arches.
+# the MeshLib bindings is built here and published as a standalone binary.
 #
 # It is built by the same Clang 22.1.8 from the llvm-pgo keg that later calls it, with -O3
 # and IR-PGO, as the clang kegs themselves are. The profile is collected by linking a Mach-O
 # dylib both plainly and with ThinLTO, which is what the bindings link looks like.
+#
+# The build runs on our two self-hosted machines, because they carry the oldest SDKs we have
+# (12.3 on the Intel Mac Pro, 13.3 on the arm64 laptop) and a locally built keg whose minos
+# matches the host. macOS runs newer systems' processes fine the other way round, so the
+# `verify` job below installs the result on the hosted runners and links with it there.
 
 on:
   push:
@@ -20,20 +25,7 @@ concurrency:
 env:
   LLVM_VER: 22.1.8
   LLVM_SRC_SHA: 922f1817a0df7b1489272d18134ee0087a8b068828f87ac63b9861b1a9965888
-  # No zstd/libxml2/terminfo: the result must not link against keg-only brew libraries.
-  CMAKE_ARGS: >-
-    -G Ninja
-    -DCMAKE_BUILD_TYPE=Release
-    -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
-    -DLLVM_ENABLE_PROJECTS=lld
-    -DLLVM_TARGETS_TO_BUILD=X86;AArch64
-    -DLLVM_ENABLE_ASSERTIONS=OFF
-    -DLLVM_ENABLE_ZSTD=OFF
-    -DLLVM_ENABLE_LIBXML2=OFF
-    -DLLVM_ENABLE_TERMINFO=OFF
-    -DLLVM_INCLUDE_TESTS=OFF
-    -DLLVM_INCLUDE_BENCHMARKS=OFF
-    -DLLVM_INCLUDE_EXAMPLES=OFF
+  KEG_VER: 22.1.8_2
 
 jobs:
   build:
@@ -42,76 +34,78 @@ jobs:
       matrix:
         include:
           - arch: x64
-            os: macos-15-intel
+            os: [ self-hosted, macos-12-intel ]
             prefix: /usr/local
-            keg-asset: llvm-pgo-22.1.8_2-x64/llvm-pgo-22.1.8_2.x86_64_usr-local.tar.gz
-            keg-sha: 8f1f1d97e4a5391c7f871bc5cf9601a9b4a1262e6e61f1538327bb48d7ef71ed
+            deployment-target: '12.0'
           - arch: arm64
-            os: macos-15
+            os: [ self-hosted, macos-13 ]
             prefix: /opt/homebrew
-            keg-asset: llvm-pgo-22.1.8_2-arm64/llvm-pgo-22.1.8_2.arm64_opt-homebrew.tar.gz
-            keg-sha: 94f76fb55ec64490605d0e68115259426a428a78f269f7e9160726d90a22e197
+            deployment-target: '13.0'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 360
+    timeout-minutes: 480
     steps:
       - name: Fetch the LLVM sources
         run: |
           curl -fsSL -o /tmp/llvm.tar.xz \
             "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VER/llvm-project-$LLVM_VER.src.tar.xz"
           echo "$LLVM_SRC_SHA  /tmp/llvm.tar.xz" | shasum -a 256 -c -
-          mkdir -p /tmp/llvm
+          rm -rf /tmp/llvm && mkdir -p /tmp/llvm
           tar -xf /tmp/llvm.tar.xz -C /tmp/llvm --strip-components=1
 
-      - name: Install the llvm-pgo keg
+      - name: Prepare the toolchain
         run: |
-          brew install --quiet ninja zstd xz
-          curl -fsSL -o /tmp/keg.tar.gz \
-            "https://github.com/MeshInspector/toolchains/releases/download/${{ matrix.keg-asset }}"
-          echo "${{ matrix.keg-sha }}  /tmp/keg.tar.gz" | shasum -a 256 -c -
-          tar -xzf /tmp/keg.tar.gz -C "${{ matrix.prefix }}/Cellar"
-          ln -sfn ../Cellar/llvm-pgo/22.1.8_2 "${{ matrix.prefix }}/opt/llvm-pgo"
-          KEG="${{ matrix.prefix }}/Cellar/llvm-pgo/22.1.8_2"
+          # The keg is the one this machine built for itself; never replace it with a
+          # published keg, whose minos would be higher than this host's.
+          KEG="${{ matrix.prefix }}/Cellar/llvm-pgo/$KEG_VER"
+          [[ -x "$KEG/bin/clang++" ]] || { echo "no llvm-pgo keg at $KEG" >&2 ; exit 1 ; }
           "$KEG/bin/clang++" --version | head -n1
           echo "KEG=$KEG" >> $GITHUB_ENV
-          echo "CC=$KEG/bin/clang" >> $GITHUB_ENV
           echo "CXX=$KEG/bin/clang++" >> $GITHUB_ENV
           # The keg's Clang has no built-in sysroot, so every compile and link below needs
           # -isysroot, exactly as scripts/mrbind/generate.mk passes it in MeshLib.
           echo "SDKROOT=$( xcrun --show-sdk-path )" >> $GITHUB_ENV
+          # Keep ~2 GiB per compile: the arm64 laptop has 10 cores but only 16 GiB.
+          cores=$( sysctl -n hw.logicalcpu )
+          jobs=$(( $( sysctl -n hw.memsize ) / 2147483648 ))
+          if [[ $jobs -gt $cores ]] ; then jobs=$cores ; fi
+          if [[ $jobs -lt 1 ]] ; then jobs=1 ; fi
+          echo "JOBS=$jobs" >> $GITHUB_ENV
+          echo "$( sw_vers -productVersion ) $( uname -m ), -j$jobs of $cores cores, SDK $( xcrun --show-sdk-version )"
+          # No zstd/libxml2/terminfo: the result must not link against keg-only brew libraries.
+          echo "CMAKE_ARGS=-G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_PROJECTS=lld -DLLVM_TARGETS_TO_BUILD=X86;AArch64 -DCMAKE_OSX_DEPLOYMENT_TARGET=${{ matrix.deployment-target }} -DCMAKE_C_COMPILER=$KEG/bin/clang -DCMAKE_CXX_COMPILER=$KEG/bin/clang++ -DLLVM_ENABLE_ASSERTIONS=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF" >> $GITHUB_ENV
 
       - name: Build the instrumented lld
         run: |
-          cmake -S /tmp/llvm/llvm -B /tmp/b-instr $CMAKE_ARGS \
-            -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
-            -DLLVM_BUILD_INSTRUMENTED=IR
-          cmake --build /tmp/b-instr --target lld
-          mkdir -p /tmp/bin-instr
+          rm -rf /tmp/b-instr
+          cmake -S /tmp/llvm/llvm -B /tmp/b-instr $CMAKE_ARGS -DLLVM_BUILD_INSTRUMENTED=IR
+          cmake --build /tmp/b-instr --target lld -j "$JOBS"
+          rm -rf /tmp/bin-instr && mkdir -p /tmp/bin-instr
           cp /tmp/b-instr/bin/lld /tmp/bin-instr/ld64.lld
 
       - name: Compile the training and benchmark objects
         run: |
-          # llvm/lib/Support is ~130 translation units of ordinary C++, and its dylib link is
+          # llvm/lib/Support is ~165 translation units of ordinary C++, and its dylib link is
           # close in shape to a bindings fragment: many objects, ThinLTO, -Wl,-x.
           cat > /tmp/cc1.sh <<'SH'
           #!/bin/bash
           set -e
           src="$1" ; out="$2" ; shift 2
           "$CXX" -c "$src" -o "$out/$( basename "$src" .cpp ).o" -O2 -std=c++17 -fPIC -w \
-            -isysroot "$SDKROOT" -I/tmp/llvm/llvm/include -I/tmp/b-instr/include \n            -I/tmp/llvm/third-party/siphash/include "$@"
+            -isysroot "$SDKROOT" -I/tmp/llvm/llvm/include -I/tmp/b-instr/include \
+            -I/tmp/llvm/third-party/siphash/include "$@"
           SH
           chmod +x /tmp/cc1.sh
-          mkdir -p /tmp/objs /tmp/objs-lto
-          jobs=$( sysctl -n hw.logicalcpu )
+          rm -rf /tmp/objs /tmp/objs-lto && mkdir -p /tmp/objs /tmp/objs-lto
           # A few units may not compile standalone; the count below is what matters.
-          ls /tmp/llvm/llvm/lib/Support/*.cpp | xargs -P $jobs -I{} sh -c '/tmp/cc1.sh "$@" || true' _ {} /tmp/objs
-          ls /tmp/llvm/llvm/lib/Support/*.cpp | xargs -P $jobs -I{} sh -c '/tmp/cc1.sh "$@" || true' _ {} /tmp/objs-lto -flto=thin
+          ls /tmp/llvm/llvm/lib/Support/*.cpp | xargs -P "$JOBS" -I{} sh -c '/tmp/cc1.sh "$@" || true' _ {} /tmp/objs
+          ls /tmp/llvm/llvm/lib/Support/*.cpp | xargs -P "$JOBS" -I{} sh -c '/tmp/cc1.sh "$@" || true' _ {} /tmp/objs-lto -flto=thin
           n=$( ls /tmp/objs/*.o | wc -l ) ; nlto=$( ls /tmp/objs-lto/*.o | wc -l )
           echo "$n plain objects, $nlto ThinLTO objects"
           [[ $n -ge 80 && $nlto -ge 80 ]] || { echo "too few objects to train on" >&2 ; exit 1 ; }
 
       - name: Train the instrumented lld
         run: |
-          mkdir -p /tmp/prof
+          rm -rf /tmp/prof && mkdir -p /tmp/prof
           export LLVM_PROFILE_FILE=/tmp/prof/%4m.profraw
           # Without LLD_IN_TEST lld_main takes the exitEarly path and leaves via _exit(),
           # which skips the atexit writer of the profile runtime and yields no .profraw.
@@ -132,12 +126,15 @@ jobs:
         run: |
           for variant in plain pgo ; do
             profile=$( [ $variant = pgo ] && echo "-DLLVM_PROFDATA_FILE=/tmp/lld.profdata" || echo "" )
-            cmake -S /tmp/llvm/llvm -B /tmp/b-$variant $CMAKE_ARGS \
-              -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" $profile
-            cmake --build /tmp/b-$variant --target lld
-            mkdir -p /tmp/bin-$variant
+            rm -rf /tmp/b-$variant
+            cmake -S /tmp/llvm/llvm -B /tmp/b-$variant $CMAKE_ARGS $profile
+            cmake --build /tmp/b-$variant --target lld -j "$JOBS"
+            rm -rf /tmp/bin-$variant && mkdir -p /tmp/bin-$variant
             cp /tmp/b-$variant/bin/lld /tmp/bin-$variant/ld64.lld
             strip -x /tmp/bin-$variant/ld64.lld
+            # stripping invalidates the linker's ad-hoc signature, and arm64 refuses to run
+            # an unsigned Mach-O, so sign it again.
+            codesign -f -s - /tmp/bin-$variant/ld64.lld
             /tmp/bin-$variant/ld64.lld --version
           done
 
@@ -157,6 +154,7 @@ jobs:
       - name: Check the PGO binary is self-contained and links the bindings' way
         run: |
           otool -L /tmp/bin-pgo/ld64.lld
+          otool -l /tmp/bin-pgo/ld64.lld | grep -A3 -E "LC_BUILD_VERSION|LC_VERSION_MIN" | head -n 8
           ls -l /tmp/bin-pgo/ld64.lld
           printf 'int f( int x ) { return x + 1; }\n' > /tmp/a.cpp
           PATH="/tmp/bin-pgo:$PATH" "$CXX" -isysroot "$SDKROOT" -Oz -flto=thin -dynamiclib -fuse-ld=lld -Wl,-x \
@@ -165,7 +163,7 @@ jobs:
 
       - name: Package
         run: |
-          mkdir -p /tmp/out
+          rm -rf /tmp/out && mkdir -p /tmp/out
           cp /tmp/bin-pgo/ld64.lld /tmp/out/ld64.lld
           cp /tmp/bin-plain/ld64.lld /tmp/out/ld64.lld-no-pgo
           cd /tmp/out && shasum -a 256 ld64.lld ld64.lld-no-pgo | tee sha256.txt
@@ -176,3 +174,71 @@ jobs:
           name: ld64.lld-macos-${{ matrix.arch }}
           path: /tmp/out/*
           if-no-files-found: error
+
+      - name: Clean up
+        if: always()
+        run: |
+          # These machines keep /tmp between jobs, and the build trees are ~20 GB.
+          rm -rf /tmp/llvm /tmp/llvm.tar.xz /tmp/b-instr /tmp/b-plain /tmp/b-pgo \
+            /tmp/objs /tmp/objs-lto /tmp/bin-instr /tmp/bin-plain /tmp/bin-pgo /tmp/prof /tmp/out \
+            /tmp/train.dylib /tmp/train-lto.dylib /tmp/bench.dylib /tmp/liba.dylib /tmp/a.cpp \
+            /tmp/cc1.sh /tmp/lld.profdata
+          df -h /tmp | tail -n 1
+
+  # The whole point of building on the older machines: the binaries must still work on the
+  # runners that will use them. Installs each one next to the published keg's Clang and links.
+  verify:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            arch: x64
+            prefix: /usr/local
+            keg-asset: llvm-pgo-22.1.8_2-x64/llvm-pgo-22.1.8_2.x86_64_usr-local.tar.gz
+            keg-sha: 8f1f1d97e4a5391c7f871bc5cf9601a9b4a1262e6e61f1538327bb48d7ef71ed
+          - os: macos-26-intel
+            arch: x64
+            prefix: /usr/local
+            keg-asset: llvm-pgo-22.1.8_2-x64/llvm-pgo-22.1.8_2.x86_64_usr-local.tar.gz
+            keg-sha: 8f1f1d97e4a5391c7f871bc5cf9601a9b4a1262e6e61f1538327bb48d7ef71ed
+          - os: macos-15
+            arch: arm64
+            prefix: /opt/homebrew
+            keg-asset: llvm-pgo-22.1.8_2-arm64/llvm-pgo-22.1.8_2.arm64_opt-homebrew.tar.gz
+            keg-sha: 94f76fb55ec64490605d0e68115259426a428a78f269f7e9160726d90a22e197
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - name: Download the built linker
+        uses: actions/download-artifact@v8
+        with:
+          name: ld64.lld-macos-${{ matrix.arch }}
+          path: /tmp/lld
+
+      - name: Install the published keg
+        run: |
+          brew install --quiet zstd xz
+          KEG="${{ matrix.prefix }}/Cellar/llvm-pgo/$KEG_VER"
+          if [[ ! -x "$KEG/bin/clang++" ]] ; then
+            curl -fsSL -o /tmp/keg.tar.gz \
+              "https://github.com/MeshInspector/toolchains/releases/download/${{ matrix.keg-asset }}"
+            echo "${{ matrix.keg-sha }}  /tmp/keg.tar.gz" | shasum -a 256 -c -
+            tar -xzf /tmp/keg.tar.gz -C "${{ matrix.prefix }}/Cellar"
+            ln -sfn ../Cellar/llvm-pgo/$KEG_VER "${{ matrix.prefix }}/opt/llvm-pgo"
+          fi
+          echo "KEG=$KEG" >> $GITHUB_ENV
+          echo "SDKROOT=$( xcrun --show-sdk-path )" >> $GITHUB_ENV
+
+      - name: Link with it on this system
+        run: |
+          echo "host $( sw_vers -productVersion ) $( uname -m ), SDK $( xcrun --show-sdk-version )"
+          cd /tmp/lld && shasum -a 256 -c sha256.txt
+          chmod +x /tmp/lld/ld64.lld
+          otool -l /tmp/lld/ld64.lld | grep -A3 -E "LC_BUILD_VERSION|LC_VERSION_MIN" | head -n 8
+          /tmp/lld/ld64.lld --version
+          printf 'int f( int x ) { return x + 1; }\n' > /tmp/a.cpp
+          PATH="/tmp/lld:$PATH" "$KEG/bin/clang++" -isysroot "$SDKROOT" -Oz -flto=thin \
+            -dynamiclib -fuse-ld=lld -Wl,-x /tmp/a.cpp -o /tmp/liba.dylib
+          nm -gU /tmp/liba.dylib
