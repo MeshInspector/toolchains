@@ -1,28 +1,25 @@
-name: Build ld64.lld for Intel macOS
+name: Build ld64.lld for macOS
 
 # Homebrew stopped bottling `lld` for Intel macOS when it became a Tier 3 configuration,
 # and neither our llvm-pgo keg nor the bottled llvm@22 contains ld64.lld, so the linker of
-# the MeshLib bindings is built here and published as a standalone binary.
+# the MeshLib bindings is built here and published as a standalone binary for both arches.
 #
 # It is built by the same Clang 22.1.8 from the llvm-pgo keg that later calls it, with -O3
-# and IR-PGO, as the clang kegs themselves are. The profile is collected by linking a
-# Mach-O dylib both plainly and with ThinLTO, which is what the bindings link looks like.
+# and IR-PGO, as the clang kegs themselves are. The profile is collected by linking a Mach-O
+# dylib both plainly and with ThinLTO, which is what the bindings link looks like.
 
 on:
   push:
-    paths: [ '.github/workflows/build-lld-macos-x64.yml' ]
+    paths: [ '.github/workflows/build-lld-macos.yml' ]
   workflow_dispatch:
 
 concurrency:
-  group: build-lld-macos-x64
+  group: build-lld-macos-${{ github.ref }}
   cancel-in-progress: false
 
 env:
   LLVM_VER: 22.1.8
   LLVM_SRC_SHA: 922f1817a0df7b1489272d18134ee0087a8b068828f87ac63b9861b1a9965888
-  KEG_ASSET: llvm-pgo-22.1.8_2-x64/llvm-pgo-22.1.8_2.x86_64_usr-local.tar.gz
-  KEG_SHA: 8f1f1d97e4a5391c7f871bc5cf9601a9b4a1262e6e61f1538327bb48d7ef71ed
-  KEG: /usr/local/Cellar/llvm-pgo/22.1.8_2
   # No zstd/libxml2/terminfo: the result must not link against keg-only brew libraries.
   CMAKE_ARGS: >-
     -G Ninja
@@ -40,7 +37,21 @@ env:
 
 jobs:
   build:
-    runs-on: macos-15-intel
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            os: macos-15-intel
+            prefix: /usr/local
+            keg-asset: llvm-pgo-22.1.8_2-x64/llvm-pgo-22.1.8_2.x86_64_usr-local.tar.gz
+            keg-sha: 8f1f1d97e4a5391c7f871bc5cf9601a9b4a1262e6e61f1538327bb48d7ef71ed
+          - arch: arm64
+            os: macos-15
+            prefix: /opt/homebrew
+            keg-asset: llvm-pgo-22.1.8_2-arm64/llvm-pgo-22.1.8_2.arm64_opt-homebrew.tar.gz
+            keg-sha: 94f76fb55ec64490605d0e68115259426a428a78f269f7e9160726d90a22e197
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 360
     steps:
       - name: Fetch the LLVM sources
@@ -54,11 +65,14 @@ jobs:
       - name: Install the llvm-pgo keg
         run: |
           brew install --quiet ninja zstd xz
-          curl -fsSL -o /tmp/keg.tar.gz "https://github.com/MeshInspector/toolchains/releases/download/$KEG_ASSET"
-          echo "$KEG_SHA  /tmp/keg.tar.gz" | shasum -a 256 -c -
-          tar -xzf /tmp/keg.tar.gz -C /usr/local/Cellar
-          ln -sfn ../Cellar/llvm-pgo/22.1.8_2 /usr/local/opt/llvm-pgo
+          curl -fsSL -o /tmp/keg.tar.gz \
+            "https://github.com/MeshInspector/toolchains/releases/download/${{ matrix.keg-asset }}"
+          echo "${{ matrix.keg-sha }}  /tmp/keg.tar.gz" | shasum -a 256 -c -
+          tar -xzf /tmp/keg.tar.gz -C "${{ matrix.prefix }}/Cellar"
+          ln -sfn ../Cellar/llvm-pgo/22.1.8_2 "${{ matrix.prefix }}/opt/llvm-pgo"
+          KEG="${{ matrix.prefix }}/Cellar/llvm-pgo/22.1.8_2"
           "$KEG/bin/clang++" --version | head -n1
+          echo "KEG=$KEG" >> $GITHUB_ENV
           echo "CC=$KEG/bin/clang" >> $GITHUB_ENV
           echo "CXX=$KEG/bin/clang++" >> $GITHUB_ENV
 
@@ -79,7 +93,8 @@ jobs:
           #!/bin/bash
           set -e
           src="$1" ; out="$2" ; shift 2
-          "$CXX" -c "$src" -o "$out/$( basename "$src" .cpp ).o" -O2 -std=c++17 -fPIC -w -I/tmp/llvm/llvm/include -I/tmp/b-instr/include "$@"
+          "$CXX" -c "$src" -o "$out/$( basename "$src" .cpp ).o" -O2 -std=c++17 -fPIC -w \
+            -I/tmp/llvm/llvm/include -I/tmp/b-instr/include "$@"
           SH
           chmod +x /tmp/cc1.sh
           mkdir -p /tmp/objs /tmp/objs-lto
@@ -95,7 +110,7 @@ jobs:
         run: |
           mkdir -p /tmp/prof
           export LLVM_PROFILE_FILE=/tmp/prof/%4m.profraw
-          for i in 1 2 3; do
+          for i in 1 2 3 ; do
             PATH="/tmp/bin-instr:$PATH" "$CXX" -dynamiclib -fuse-ld=lld -Wl,-x \
               -Wl,-undefined,dynamic_lookup /tmp/objs/*.o -o /tmp/train.dylib
             PATH="/tmp/bin-instr:$PATH" "$CXX" -dynamiclib -fuse-ld=lld -Wl,-x -Oz -flto=thin \
@@ -108,7 +123,7 @@ jobs:
       - name: Build lld plain and with the profile
         run: |
           for variant in plain pgo ; do
-            profile=$([ $variant = pgo ] && echo "-DLLVM_PROFDATA_FILE=/tmp/lld.profdata" || echo "")
+            profile=$( [ $variant = pgo ] && echo "-DLLVM_PROFDATA_FILE=/tmp/lld.profdata" || echo "" )
             cmake -S /tmp/llvm/llvm -B /tmp/b-$variant $CMAKE_ARGS \
               -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" $profile
             cmake --build /tmp/b-$variant --target lld
@@ -124,7 +139,8 @@ jobs:
           {
             local dir="$1" ; shift
             for i in 1 2 3 4 5 ; do
-              PATH="$dir:$PATH" /usr/bin/time -p "$CXX" -dynamiclib -fuse-ld=lld -Wl,-x -Wl,-undefined,dynamic_lookup "$@" -o /tmp/bench.dylib 2>&1 | awk '/^real/ { print $2 }'
+              PATH="$dir:$PATH" /usr/bin/time -p "$CXX" -dynamiclib -fuse-ld=lld -Wl,-x \
+                -Wl,-undefined,dynamic_lookup "$@" -o /tmp/bench.dylib 2>&1 | awk '/^real/ { print $2 }'
             done | sort -n | head -n 1
           }
           echo "plain link:   no-pgo $( bench /tmp/bin-plain /tmp/objs/*.o ) s, pgo $( bench /tmp/bin-pgo /tmp/objs/*.o ) s"
@@ -149,6 +165,6 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v7
         with:
-          name: ld64.lld-macos-x64
+          name: ld64.lld-macos-${{ matrix.arch }}
           path: /tmp/out/*
           if-no-files-found: error
