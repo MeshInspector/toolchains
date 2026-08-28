@@ -97,7 +97,7 @@ jobs:
           set -e
           src="$1" ; out="$2" ; shift 2
           "$CXX" -c "$src" -o "$out/$( basename "$src" .cpp ).o" -O2 -std=c++17 -fPIC -w \
-            -isysroot "$SDKROOT" -I/tmp/llvm/llvm/include -I/tmp/b-instr/include "$@"
+            -isysroot "$SDKROOT" -I/tmp/llvm/llvm/include -I/tmp/b-instr/include \n            -I/tmp/llvm/third-party/siphash/include "$@"
           SH
           chmod +x /tmp/cc1.sh
           mkdir -p /tmp/objs /tmp/objs-lto
@@ -113,13 +113,18 @@ jobs:
         run: |
           mkdir -p /tmp/prof
           export LLVM_PROFILE_FILE=/tmp/prof/%4m.profraw
+          # Without LLD_IN_TEST lld_main takes the exitEarly path and leaves via _exit(),
+          # which skips the atexit writer of the profile runtime and yields no .profraw.
+          export LLD_IN_TEST=1
           for i in 1 2 3 ; do
             PATH="/tmp/bin-instr:$PATH" "$CXX" -isysroot "$SDKROOT" -dynamiclib -fuse-ld=lld -Wl,-x \
               -Wl,-undefined,dynamic_lookup /tmp/objs/*.o -o /tmp/train.dylib
             PATH="/tmp/bin-instr:$PATH" "$CXX" -isysroot "$SDKROOT" -dynamiclib -fuse-ld=lld -Wl,-x -Oz -flto=thin \
               -Wl,-undefined,dynamic_lookup /tmp/objs-lto/*.o -o /tmp/train-lto.dylib
           done
-          ls /tmp/prof | wc -l
+          n=$( ls /tmp/prof/*.profraw 2>/dev/null | wc -l )
+          echo "$n raw profiles"
+          [[ $n -ge 1 ]] || { echo "the instrumented lld wrote no profile" >&2 ; exit 1 ; }
           "$KEG/bin/llvm-profdata" merge -output=/tmp/lld.profdata /tmp/prof/*.profraw
           "$KEG/bin/llvm-profdata" show --topn=5 /tmp/lld.profdata | head -n 20
 
