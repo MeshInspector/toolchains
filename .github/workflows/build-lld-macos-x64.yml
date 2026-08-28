@@ -1,0 +1,79 @@
+name: Build ld64.lld for Intel macOS
+
+# Homebrew stopped bottling `lld` for Intel macOS when it became a Tier 3 configuration,
+# and neither our llvm-pgo keg nor the bottled llvm@22 contains ld64.lld, so the linker of
+# the MeshLib bindings is built here and published as a standalone binary.
+
+on:
+  push:
+    paths: [ '.github/workflows/build-lld-macos-x64.yml' ]
+  workflow_dispatch:
+
+env:
+  LLVM_VER: 22.1.8
+  LLVM_SRC_SHA: 922f1817a0df7b1489272d18134ee0087a8b068828f87ac63b9861b1a9965888
+  KEG_ASSET: llvm-pgo-22.1.8_2-x64/llvm-pgo-22.1.8_2.x86_64_usr-local.tar.gz
+  KEG_SHA: 8f1f1d97e4a5391c7f871bc5cf9601a9b4a1262e6e61f1538327bb48d7ef71ed
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 180
+    steps:
+      - name: Fetch the LLVM sources
+        run: |
+          curl -fsSL -o /tmp/llvm.tar.xz \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VER/llvm-project-$LLVM_VER.src.tar.xz"
+          echo "$LLVM_SRC_SHA  /tmp/llvm.tar.xz" | shasum -a 256 -c -
+          mkdir -p /tmp/llvm
+          tar -xf /tmp/llvm.tar.xz -C /tmp/llvm --strip-components=1
+
+      - name: Build lld
+        run: |
+          brew install --quiet ninja
+          # No zstd/libxml2/terminfo: the result must not link against keg-only brew libraries.
+          cmake -S /tmp/llvm/llvm -B /tmp/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+            -DLLVM_ENABLE_PROJECTS=lld \
+            -DLLVM_TARGETS_TO_BUILD="X86;AArch64" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF
+          cmake --build /tmp/build --target lld
+
+      - name: Package
+        run: |
+          mkdir -p /tmp/out
+          # lld selects its flavor by argv[0], so the binary itself is named ld64.lld
+          cp /tmp/build/bin/lld /tmp/out/ld64.lld
+          strip -x /tmp/out/ld64.lld
+          chmod +x /tmp/out/ld64.lld
+          /tmp/out/ld64.lld --version
+          otool -L /tmp/out/ld64.lld
+          ls -l /tmp/out/ld64.lld
+          cd /tmp/out && shasum -a 256 ld64.lld | tee sha256.txt
+
+      - name: Link a ThinLTO dylib with the llvm-pgo keg
+        run: |
+          curl -fsSL -o /tmp/keg.tar.gz "https://github.com/MeshInspector/toolchains/releases/download/$KEG_ASSET"
+          echo "$KEG_SHA  /tmp/keg.tar.gz" | shasum -a 256 -c -
+          tar -xzf /tmp/keg.tar.gz -C "$(brew --prefix)/Cellar"
+          brew install --quiet zstd xz
+          KEG="$(brew --prefix)/Cellar/llvm-pgo/22.1.8_2"
+          printf 'int f( int x ) { return x + 1; }\n' > /tmp/a.cpp
+          # -Oz -flto=thin -Wl,-x is what scripts/mrbind/generate.mk uses for the bindings
+          PATH="/tmp/out:$PATH" "$KEG/bin/clang++" -Oz -flto=thin -dynamiclib -fuse-ld=lld -Wl,-x /tmp/a.cpp -o /tmp/liba.dylib
+          otool -hv /tmp/liba.dylib | tail -n 2
+          nm -gU /tmp/liba.dylib
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: ld64.lld-macos-x64
+          path: /tmp/out/*
+          if-no-files-found: error
