@@ -120,7 +120,19 @@ jobs:
           GCC_VER=$(g++-14 -dumpfullversion)
           echo "GCC_VER=${GCC_VER}" >> "$GITHUB_ENV"
           echo "matching distro g++-14 upstream version: ${GCC_VER}"
-          curl -fsSL -o gcc.tar.xz "https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VER}/gcc-${GCC_VER}.tar.xz"
+          REL="gcc-${GCC_VER}/gcc-${GCC_VER}.tar.xz"
+          # ftp.gnu.org went down mid-experiment, so try mirrors first
+          URLS=(
+            "https://ftpmirror.gnu.org/gcc/${REL}"
+            "https://mirrors.kernel.org/gnu/gcc/${REL}"
+            "https://gcc.gnu.org/pub/gcc/releases/${REL}"
+            "https://ftp.gnu.org/gnu/gcc/${REL}"
+          )
+          for u in "${URLS[@]}"; do
+            echo "trying ${u}"
+            if curl -fsSL --retry 3 --retry-all-errors --retry-delay 5 --connect-timeout 20 -o gcc.tar.xz "${u}"; then break; fi
+          done
+          test -s gcc.tar.xz
           tar -xf gcc.tar.xz
 
       - name: Instrument and train on the target libs
