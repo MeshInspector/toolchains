@@ -3,22 +3,45 @@ name: Build ld64.lld for Intel macOS
 # Homebrew stopped bottling `lld` for Intel macOS when it became a Tier 3 configuration,
 # and neither our llvm-pgo keg nor the bottled llvm@22 contains ld64.lld, so the linker of
 # the MeshLib bindings is built here and published as a standalone binary.
+#
+# It is built by the same Clang 22.1.8 from the llvm-pgo keg that later calls it, with -O3
+# and IR-PGO, as the clang kegs themselves are. The profile is collected by linking a
+# Mach-O dylib both plainly and with ThinLTO, which is what the bindings link looks like.
 
 on:
   push:
     paths: [ '.github/workflows/build-lld-macos-x64.yml' ]
   workflow_dispatch:
 
+concurrency:
+  group: build-lld-macos-x64
+  cancel-in-progress: false
+
 env:
   LLVM_VER: 22.1.8
   LLVM_SRC_SHA: 922f1817a0df7b1489272d18134ee0087a8b068828f87ac63b9861b1a9965888
   KEG_ASSET: llvm-pgo-22.1.8_2-x64/llvm-pgo-22.1.8_2.x86_64_usr-local.tar.gz
   KEG_SHA: 8f1f1d97e4a5391c7f871bc5cf9601a9b4a1262e6e61f1538327bb48d7ef71ed
+  KEG: /usr/local/Cellar/llvm-pgo/22.1.8_2
+  # No zstd/libxml2/terminfo: the result must not link against keg-only brew libraries.
+  CMAKE_ARGS: >-
+    -G Ninja
+    -DCMAKE_BUILD_TYPE=Release
+    -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
+    -DLLVM_ENABLE_PROJECTS=lld
+    -DLLVM_TARGETS_TO_BUILD=X86;AArch64
+    -DLLVM_ENABLE_ASSERTIONS=OFF
+    -DLLVM_ENABLE_ZSTD=OFF
+    -DLLVM_ENABLE_LIBXML2=OFF
+    -DLLVM_ENABLE_TERMINFO=OFF
+    -DLLVM_INCLUDE_TESTS=OFF
+    -DLLVM_INCLUDE_BENCHMARKS=OFF
+    -DLLVM_INCLUDE_EXAMPLES=OFF
 
 jobs:
   build:
     runs-on: macos-15-intel
-    timeout-minutes: 180
+    timeout-minutes: 360
     steps:
       - name: Fetch the LLVM sources
         run: |
@@ -28,48 +51,100 @@ jobs:
           mkdir -p /tmp/llvm
           tar -xf /tmp/llvm.tar.xz -C /tmp/llvm --strip-components=1
 
-      - name: Build lld
+      - name: Install the llvm-pgo keg
         run: |
-          brew install --quiet ninja
-          # No zstd/libxml2/terminfo: the result must not link against keg-only brew libraries.
-          cmake -S /tmp/llvm/llvm -B /tmp/build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
-            -DLLVM_ENABLE_PROJECTS=lld \
-            -DLLVM_TARGETS_TO_BUILD="X86;AArch64" \
-            -DLLVM_ENABLE_ASSERTIONS=OFF \
-            -DLLVM_ENABLE_ZSTD=OFF \
-            -DLLVM_ENABLE_LIBXML2=OFF \
-            -DLLVM_ENABLE_TERMINFO=OFF \
-            -DLLVM_INCLUDE_TESTS=OFF \
-            -DLLVM_INCLUDE_BENCHMARKS=OFF \
-            -DLLVM_INCLUDE_EXAMPLES=OFF
-          cmake --build /tmp/build --target lld
+          brew install --quiet ninja zstd xz
+          curl -fsSL -o /tmp/keg.tar.gz "https://github.com/MeshInspector/toolchains/releases/download/$KEG_ASSET"
+          echo "$KEG_SHA  /tmp/keg.tar.gz" | shasum -a 256 -c -
+          tar -xzf /tmp/keg.tar.gz -C /usr/local/Cellar
+          ln -sfn ../Cellar/llvm-pgo/22.1.8_2 /usr/local/opt/llvm-pgo
+          "$KEG/bin/clang++" --version | head -n1
+          echo "CC=$KEG/bin/clang" >> $GITHUB_ENV
+          echo "CXX=$KEG/bin/clang++" >> $GITHUB_ENV
+
+      - name: Build the instrumented lld
+        run: |
+          cmake -S /tmp/llvm/llvm -B /tmp/b-instr $CMAKE_ARGS \
+            -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
+            -DLLVM_BUILD_INSTRUMENTED=IR
+          cmake --build /tmp/b-instr --target lld
+          mkdir -p /tmp/bin-instr
+          cp /tmp/b-instr/bin/lld /tmp/bin-instr/ld64.lld
+
+      - name: Compile the training and benchmark objects
+        run: |
+          # llvm/lib/Support is ~130 translation units of ordinary C++, and its dylib link is
+          # close in shape to a bindings fragment: many objects, ThinLTO, -Wl,-x.
+          cat > /tmp/cc1.sh <<'SH'
+          #!/bin/bash
+          set -e
+          src="$1" ; out="$2" ; shift 2
+          "$CXX" -c "$src" -o "$out/$( basename "$src" .cpp ).o" -O2 -std=c++17 -fPIC -w -I/tmp/llvm/llvm/include -I/tmp/b-instr/include "$@"
+          SH
+          chmod +x /tmp/cc1.sh
+          mkdir -p /tmp/objs /tmp/objs-lto
+          jobs=$( sysctl -n hw.logicalcpu )
+          # A few units may not compile standalone; the count below is what matters.
+          ls /tmp/llvm/llvm/lib/Support/*.cpp | xargs -P $jobs -I{} sh -c '/tmp/cc1.sh "$@" || true' _ {} /tmp/objs
+          ls /tmp/llvm/llvm/lib/Support/*.cpp | xargs -P $jobs -I{} sh -c '/tmp/cc1.sh "$@" || true' _ {} /tmp/objs-lto -flto=thin
+          n=$( ls /tmp/objs/*.o | wc -l ) ; nlto=$( ls /tmp/objs-lto/*.o | wc -l )
+          echo "$n plain objects, $nlto ThinLTO objects"
+          [[ $n -ge 80 && $nlto -ge 80 ]] || { echo "too few objects to train on" >&2 ; exit 1 ; }
+
+      - name: Train the instrumented lld
+        run: |
+          mkdir -p /tmp/prof
+          export LLVM_PROFILE_FILE=/tmp/prof/%4m.profraw
+          for i in 1 2 3; do
+            PATH="/tmp/bin-instr:$PATH" "$CXX" -dynamiclib -fuse-ld=lld -Wl,-x \
+              -Wl,-undefined,dynamic_lookup /tmp/objs/*.o -o /tmp/train.dylib
+            PATH="/tmp/bin-instr:$PATH" "$CXX" -dynamiclib -fuse-ld=lld -Wl,-x -Oz -flto=thin \
+              -Wl,-undefined,dynamic_lookup /tmp/objs-lto/*.o -o /tmp/train-lto.dylib
+          done
+          ls /tmp/prof | wc -l
+          "$KEG/bin/llvm-profdata" merge -output=/tmp/lld.profdata /tmp/prof/*.profraw
+          "$KEG/bin/llvm-profdata" show --topn=5 /tmp/lld.profdata | head -n 20
+
+      - name: Build lld plain and with the profile
+        run: |
+          for variant in plain pgo ; do
+            profile=$([ $variant = pgo ] && echo "-DLLVM_PROFDATA_FILE=/tmp/lld.profdata" || echo "")
+            cmake -S /tmp/llvm/llvm -B /tmp/b-$variant $CMAKE_ARGS \
+              -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" $profile
+            cmake --build /tmp/b-$variant --target lld
+            mkdir -p /tmp/bin-$variant
+            cp /tmp/b-$variant/bin/lld /tmp/bin-$variant/ld64.lld
+            strip -x /tmp/bin-$variant/ld64.lld
+            /tmp/bin-$variant/ld64.lld --version
+          done
+
+      - name: Bench the two, min of 5 links each
+        run: |
+          bench() # $1 = directory holding ld64.lld, $2... = link arguments
+          {
+            local dir="$1" ; shift
+            for i in 1 2 3 4 5 ; do
+              PATH="$dir:$PATH" /usr/bin/time -p "$CXX" -dynamiclib -fuse-ld=lld -Wl,-x -Wl,-undefined,dynamic_lookup "$@" -o /tmp/bench.dylib 2>&1 | awk '/^real/ { print $2 }'
+            done | sort -n | head -n 1
+          }
+          echo "plain link:   no-pgo $( bench /tmp/bin-plain /tmp/objs/*.o ) s, pgo $( bench /tmp/bin-pgo /tmp/objs/*.o ) s"
+          echo "ThinLTO link: no-pgo $( bench /tmp/bin-plain -Oz -flto=thin /tmp/objs-lto/*.o ) s, pgo $( bench /tmp/bin-pgo -Oz -flto=thin /tmp/objs-lto/*.o ) s"
+
+      - name: Check the PGO binary is self-contained and links the bindings' way
+        run: |
+          otool -L /tmp/bin-pgo/ld64.lld
+          ls -l /tmp/bin-pgo/ld64.lld
+          printf 'int f( int x ) { return x + 1; }\n' > /tmp/a.cpp
+          PATH="/tmp/bin-pgo:$PATH" "$CXX" -Oz -flto=thin -dynamiclib -fuse-ld=lld -Wl,-x \
+            /tmp/a.cpp -o /tmp/liba.dylib
+          nm -gU /tmp/liba.dylib
 
       - name: Package
         run: |
           mkdir -p /tmp/out
-          # lld selects its flavor by argv[0], so the binary itself is named ld64.lld
-          cp /tmp/build/bin/lld /tmp/out/ld64.lld
-          strip -x /tmp/out/ld64.lld
-          chmod +x /tmp/out/ld64.lld
-          /tmp/out/ld64.lld --version
-          otool -L /tmp/out/ld64.lld
-          ls -l /tmp/out/ld64.lld
-          cd /tmp/out && shasum -a 256 ld64.lld | tee sha256.txt
-
-      - name: Link a ThinLTO dylib with the llvm-pgo keg
-        run: |
-          curl -fsSL -o /tmp/keg.tar.gz "https://github.com/MeshInspector/toolchains/releases/download/$KEG_ASSET"
-          echo "$KEG_SHA  /tmp/keg.tar.gz" | shasum -a 256 -c -
-          tar -xzf /tmp/keg.tar.gz -C "$(brew --prefix)/Cellar"
-          brew install --quiet zstd xz
-          KEG="$(brew --prefix)/Cellar/llvm-pgo/22.1.8_2"
-          printf 'int f( int x ) { return x + 1; }\n' > /tmp/a.cpp
-          # -Oz -flto=thin -Wl,-x is what scripts/mrbind/generate.mk uses for the bindings
-          PATH="/tmp/out:$PATH" "$KEG/bin/clang++" -Oz -flto=thin -dynamiclib -fuse-ld=lld -Wl,-x /tmp/a.cpp -o /tmp/liba.dylib
-          otool -hv /tmp/liba.dylib | tail -n 2
-          nm -gU /tmp/liba.dylib
+          cp /tmp/bin-pgo/ld64.lld /tmp/out/ld64.lld
+          cp /tmp/bin-plain/ld64.lld /tmp/out/ld64.lld-no-pgo
+          cd /tmp/out && shasum -a 256 ld64.lld ld64.lld-no-pgo | tee sha256.txt
 
       - name: Upload
         uses: actions/upload-artifact@v7
