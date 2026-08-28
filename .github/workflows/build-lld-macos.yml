@@ -75,6 +75,9 @@ jobs:
           echo "KEG=$KEG" >> $GITHUB_ENV
           echo "CC=$KEG/bin/clang" >> $GITHUB_ENV
           echo "CXX=$KEG/bin/clang++" >> $GITHUB_ENV
+          # The keg's Clang has no built-in sysroot, so every compile and link below needs
+          # -isysroot, exactly as scripts/mrbind/generate.mk passes it in MeshLib.
+          echo "SDKROOT=$( xcrun --show-sdk-path )" >> $GITHUB_ENV
 
       - name: Build the instrumented lld
         run: |
@@ -94,7 +97,7 @@ jobs:
           set -e
           src="$1" ; out="$2" ; shift 2
           "$CXX" -c "$src" -o "$out/$( basename "$src" .cpp ).o" -O2 -std=c++17 -fPIC -w \
-            -I/tmp/llvm/llvm/include -I/tmp/b-instr/include "$@"
+            -isysroot "$SDKROOT" -I/tmp/llvm/llvm/include -I/tmp/b-instr/include "$@"
           SH
           chmod +x /tmp/cc1.sh
           mkdir -p /tmp/objs /tmp/objs-lto
@@ -111,9 +114,9 @@ jobs:
           mkdir -p /tmp/prof
           export LLVM_PROFILE_FILE=/tmp/prof/%4m.profraw
           for i in 1 2 3 ; do
-            PATH="/tmp/bin-instr:$PATH" "$CXX" -dynamiclib -fuse-ld=lld -Wl,-x \
+            PATH="/tmp/bin-instr:$PATH" "$CXX" -isysroot "$SDKROOT" -dynamiclib -fuse-ld=lld -Wl,-x \
               -Wl,-undefined,dynamic_lookup /tmp/objs/*.o -o /tmp/train.dylib
-            PATH="/tmp/bin-instr:$PATH" "$CXX" -dynamiclib -fuse-ld=lld -Wl,-x -Oz -flto=thin \
+            PATH="/tmp/bin-instr:$PATH" "$CXX" -isysroot "$SDKROOT" -dynamiclib -fuse-ld=lld -Wl,-x -Oz -flto=thin \
               -Wl,-undefined,dynamic_lookup /tmp/objs-lto/*.o -o /tmp/train-lto.dylib
           done
           ls /tmp/prof | wc -l
@@ -139,7 +142,7 @@ jobs:
           {
             local dir="$1" ; shift
             for i in 1 2 3 4 5 ; do
-              PATH="$dir:$PATH" /usr/bin/time -p "$CXX" -dynamiclib -fuse-ld=lld -Wl,-x \
+              PATH="$dir:$PATH" /usr/bin/time -p "$CXX" -isysroot "$SDKROOT" -dynamiclib -fuse-ld=lld -Wl,-x \
                 -Wl,-undefined,dynamic_lookup "$@" -o /tmp/bench.dylib 2>&1 | awk '/^real/ { print $2 }'
             done | sort -n | head -n 1
           }
@@ -151,7 +154,7 @@ jobs:
           otool -L /tmp/bin-pgo/ld64.lld
           ls -l /tmp/bin-pgo/ld64.lld
           printf 'int f( int x ) { return x + 1; }\n' > /tmp/a.cpp
-          PATH="/tmp/bin-pgo:$PATH" "$CXX" -Oz -flto=thin -dynamiclib -fuse-ld=lld -Wl,-x \
+          PATH="/tmp/bin-pgo:$PATH" "$CXX" -isysroot "$SDKROOT" -Oz -flto=thin -dynamiclib -fuse-ld=lld -Wl,-x \
             /tmp/a.cpp -o /tmp/liba.dylib
           nm -gU /tmp/liba.dylib
 
