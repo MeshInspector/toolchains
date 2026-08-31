@@ -19,6 +19,7 @@ URL that `curl` can fetch anonymously.
 | [`clang-22.1.8-pgo-rockylinux8`](https://github.com/MeshInspector/toolchains/releases/tag/clang-22.1.8-pgo-rockylinux8) | Linux, glibc >= 2.28 | `x64`, `arm64` | `llvm-pgo-22.1.8/` | ~1 GB | superseded |
 | [`llvm-pgo-22.1.8_2-arm64`](https://github.com/MeshInspector/toolchains/releases/tag/llvm-pgo-22.1.8_2-arm64) | macOS arm64 | `arm64` | Homebrew keg under `/opt/homebrew` | ~438 MB | **current** |
 | [`llvm-pgo-22.1.8_2-x64`](https://github.com/MeshInspector/toolchains/releases/tag/llvm-pgo-22.1.8_2-x64) | macOS Intel | `x86_64` | Homebrew keg under `/usr/local` | ~468 MB | **current** |
+| [`lld-22.1.8-pgo-macos`](https://github.com/MeshInspector/toolchains/releases/tag/lld-22.1.8-pgo-macos) | macOS >= 12.0 (Intel), >= 13.0 (arm64) | `x86_64`, `arm64` | one `ld64.lld` binary, into the keg's `bin/` | 54-59 MB | **current** |
 
 To list them from the command line:
 
@@ -202,6 +203,51 @@ In MeshLib CI this is wrapped as a composite action,
 the local Cellar (self-hosted macOS runners build it themselves) and otherwise
 runs exactly the commands above.
 
+## ld64.lld 22.1.8 PGO (macOS) — `lld-22.1.8-pgo-macos`
+
+Homebrew stopped bottling `lld` for Intel macOS when it became a Tier 3
+configuration, and neither the kegs above nor the bottled `llvm@22` contains
+`ld64.lld` — the `lld` formula is separate and only depends on `llvm`. So the
+linker is built here, `-O3` + IR-PGO by the same Clang 22.1.8 from the keg that
+calls it, and trained on the link it actually does in our CI: a Mach-O dylib of
+~165 objects, plain and with ThinLTO.
+
+Each binary is built on the oldest machine of its architecture we have, because a
+Mach-O runs on systems newer than the one it was built against and not the other
+way round:
+
+| asset | arch | built on | SDK | `minos` |
+| --- | --- | --- | --- | --- |
+| `ld64.lld-22.1.8-pgo.x86_64-macos12` | `x86_64` | macOS 12.7.6 | 12.3 | 12.0 |
+| `ld64.lld-22.1.8-pgo.arm64-macos13` | `arm64` | macOS 13.4.1 | 13.3 | 13.0 |
+
+Both link only `/usr/lib/libSystem.B.dylib`, `libz.1.dylib` and `libc++.1.dylib`
+(`LLVM_ENABLE_ZSTD`, `LIBXML2` and `TERMINFO` are off), so a plain download is
+enough — no brew deps, unlike the kegs. Each was verified by linking a ThinLTO
+dylib on the hosted `macos-15-intel`, `macos-26-intel` and `macos-15` runners.
+
+Install it into the keg's `bin`, next to the Clang that calls it:
+
+    curl -fsSL -o "$( brew --prefix )/Cellar/llvm-pgo/22.1.8_2/bin/ld64.lld" \
+      https://github.com/MeshInspector/toolchains/releases/download/lld-22.1.8-pgo-macos/ld64.lld-22.1.8-pgo.x86_64-macos12
+    chmod +x "$( brew --prefix )/Cellar/llvm-pgo/22.1.8_2/bin/ld64.lld"
+
+That location is the point: Clang resolves `-fuse-ld=lld` in its own directory
+before `PATH`, so this shadows any Homebrew `ld64.lld` without replacing it, and
+uninstalling is deleting the one file. Verify with
+`clang++ -print-prog-name=ld64.lld`.
+
+Measured on the real `mrmeshpy.so` ThinLTO link in MeshInspector CI, min of 3,
+against the Homebrew `lld` each machine had:
+
+| runner | before | after |
+| --- | --- | --- |
+| Mac Pro 2013, macOS 12, `x86_64` | 164.0 s | **115.4 s** (-30%) |
+| MacBook Pro M1 Pro, macOS 13, `arm64` | 47.8 s | **36.0 s** (-25%) |
+
+Ordinary dylib links of 0.1-0.4 s show no difference at all; the gain is in
+ThinLTO codegen, which is what the profile covers.
+
 ## Who consumes these
 
 - `docker/rockylinux8-vcpkgDockerfile` in our Linux images fetches the Linux
@@ -210,6 +256,10 @@ runs exactly the commands above.
 - MeshLib `.github/workflows/build-test-macos.yml` and `pip-build.yml` install the
   macOS kegs on the GitHub-hosted runners through the composite action and use
   them for mrbind and the Python bindings.
+- The three self-hosted macOS runners (`macos-12-intel`, `macos-13`,
+  `our-macos-15`) carry the PGO `ld64.lld` inside their own kegs, installed once
+  by the workflow below, so MeshInspector builds link with it without
+  downloading anything per job.
 
 ## Rebuilding
 
@@ -227,6 +277,18 @@ per version, and pushing to that branch is what triggers the build:
 
 Budget roughly 3h of hosted-runner wall clock for a dylib build (18.1.8 took
 2h56m for all four jobs); the static+ThinLTO flavor took closer to 8h.
+
+`ld64.lld` has two workflows of its own, both triggered by pushing to their file
+and re-runnable by hand:
+
+- `.github/workflows/build-lld-macos.yml` builds it on the two oldest self-hosted
+  machines — instrumented build, training links, then a plain and a PGO build of
+  the same sources so the benchmark isolates the profile — and verifies the result
+  on the hosted runners. About 2.5h per machine.
+- `.github/workflows/install-lld-macos.yml` puts the published binary into the keg
+  on each self-hosted runner. It is checksum-verified and idempotent; re-run it
+  after a machine is reimaged or its keg is rebuilt, since either wipes the keg's
+  `bin`.
 
 The macOS kegs are built on the self-hosted macOS runners by
 `brew install --build-bottle` from a local tap, then packed straight out of the
