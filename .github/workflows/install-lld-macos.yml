@@ -11,6 +11,9 @@ name: Install ld64.lld on the self-hosted macOS runners
 
 on:
   push:
+    # not on main: merging this file must not restart hours of work on the
+    # self-hosted machines; run it from the Actions tab there instead
+    branches-ignore: [ main ]
     paths: [ '.github/workflows/install-lld-macos.yml' ]
   workflow_dispatch:
 
