@@ -1,0 +1,72 @@
+name: Install ld64.lld on the self-hosted macOS runners
+
+# Puts the PGO ld64.lld from the lld-22.1.8-pgo-macos release into each machine's llvm-pgo
+# keg, next to the Clang that calls it. Clang resolves `-fuse-ld=lld` in its own directory
+# before PATH, so from then on every build on these runners links with this linker instead
+# of the Homebrew one, without downloading anything per job -- the same way the PGO Clang
+# itself is installed once and simply stays there.
+#
+# Re-run this (workflow_dispatch) after a machine is reimaged or the llvm-pgo keg is
+# rebuilt, since both wipe the keg's bin directory.
+
+on:
+  push:
+    paths: [ '.github/workflows/install-lld-macos.yml' ]
+  workflow_dispatch:
+
+env:
+  KEG_VER: 22.1.8_2
+  RELEASE: https://github.com/MeshInspector/toolchains/releases/download/lld-22.1.8-pgo-macos
+
+jobs:
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macos-12-intel
+            asset: ld64.lld-22.1.8-pgo.x86_64-macos12
+            sha: 8c329488b4f53141933d9688eb01311f84fa1df0937098f0b50620a0fb989311
+          - label: macos-13
+            asset: ld64.lld-22.1.8-pgo.arm64-macos13
+            sha: 8abf0ba324dea357ae4fbd8baee835353b560f62e9b1d001588a6df888755550
+          - label: our-macos-15
+            asset: ld64.lld-22.1.8-pgo.arm64-macos13
+            sha: 8abf0ba324dea357ae4fbd8baee835353b560f62e9b1d001588a6df888755550
+    runs-on: [ self-hosted, "${{ matrix.label }}" ]
+    timeout-minutes: 20
+    steps:
+      - name: Install the linker into the keg
+        run: |
+          KEG="$( brew --prefix )/Cellar/llvm-pgo/$KEG_VER"
+          [[ -x "$KEG/bin/clang++" ]] || { echo "no llvm-pgo keg at $KEG" >&2 ; exit 1 ; }
+          echo "$( sw_vers -productVersion ) $( uname -m ), keg $KEG"
+
+          if [[ -x "$KEG/bin/ld64.lld" ]] && \
+             echo "${{ matrix.sha }}  $KEG/bin/ld64.lld" | shasum -a 256 -c - >/dev/null 2>&1 ; then
+            echo "already installed"
+          else
+            tmp="$( mktemp -d )"
+            curl -fsSL -o "$tmp/ld64.lld" "$RELEASE/${{ matrix.asset }}"
+            echo "${{ matrix.sha }}  $tmp/ld64.lld" | shasum -a 256 -c -
+            chmod +x "$tmp/ld64.lld"
+            "$tmp/ld64.lld" --version
+            mv -f "$tmp/ld64.lld" "$KEG/bin/ld64.lld"
+            rmdir "$tmp"
+            echo "installed"
+          fi
+
+      - name: Check that Clang now picks it up
+        run: |
+          KEG="$( brew --prefix )/Cellar/llvm-pgo/$KEG_VER"
+          resolved="$( "$KEG/bin/clang++" -print-prog-name=ld64.lld )"
+          echo "clang resolves ld64.lld to: $resolved"
+          [[ "$resolved" == "$KEG/bin/ld64.lld" ]] || { echo "still not the keg's linker" >&2 ; exit 1 ; }
+          echo "was, in PATH: $( command -v ld64.lld || echo none ) -> $( ld64.lld --version 2>/dev/null || echo none )"
+          "$resolved" --version
+          # and it links, the way the bindings are linked
+          printf 'int f( int x ) { return x + 1; }\n' > /tmp/lldcheck.cpp
+          "$KEG/bin/clang++" -isysroot "$( xcrun --show-sdk-path )" -Oz -flto=thin -dynamiclib \
+            -fuse-ld=lld -Wl,-x /tmp/lldcheck.cpp -o /tmp/lldcheck.dylib
+          nm -gU /tmp/lldcheck.dylib
+          rm -f /tmp/lldcheck.cpp /tmp/lldcheck.dylib
