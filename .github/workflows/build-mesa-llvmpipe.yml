@@ -55,8 +55,6 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qqy
           apt-get install -qqy --no-install-recommends ca-certificates git curl xz-utils pkg-config build-essential meson ninja-build bison flex python3-mako python3-yaml python3-setuptools llvm-21-dev libclang-cpp21-dev libglvnd-dev libdrm-dev libudev-dev libexpat1-dev zlib1g-dev libzstd-dev libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev libxdamage-dev libxshmfence-dev libxxf86vm-dev libxrandr-dev libxcb-dri3-dev libxcb-present-dev libxcb-sync-dev libxcb-glx0-dev libxcb-shm0-dev libxcb-randr0-dev
-          meson --version
-          llvm-config-21 --version
 
       - name: Fetch the Mesa sources
         run: |
@@ -75,7 +73,6 @@ jobs:
           set -eux
           cd /tmp/mesa
           meson setup build --prefix "$PREFIX" --buildtype release -Dgallium-drivers=llvmpipe -Dvulkan-drivers= -Dplatforms=x11 -Dglx=dri -Degl=enabled -Dgbm=enabled -Dglvnd=true -Dllvm=enabled -Dshared-llvm=enabled -Dtools= -Dvideo-codecs= ${{ inputs.extra_meson }}
-          meson configure build | sed -n '1,60p'
 
       - name: Build and install
         run: |
@@ -83,23 +80,18 @@ jobs:
           cd /tmp/mesa
           ninja -C build
           ninja -C build install
-          find "$PREFIX" -name '*.so*' -exec ls -l {} + | sort -k5 -rn | head -20
-          du -sh "$PREFIX"
 
       - name: Smoke test the stack
         run: |
           set -eux
           export DEBIAN_FRONTEND=noninteractive
           apt-get install -qqy --no-install-recommends mesa-utils xvfb
-          # the stock renderer, for the log
-          xvfb-run -a glxinfo -B | grep -E 'OpenGL (vendor|renderer|version)' || true
           # ours: libglvnd stays the distro's, the vendor libs and the DRI module are ours
           export LD_LIBRARY_PATH="$PREFIX/lib/$(uname -m)-linux-gnu:$PREFIX/lib"
           export LIBGL_DRIVERS_PATH="$PREFIX/lib/$(uname -m)-linux-gnu/dri:$PREFIX/lib/dri"
           export __GLX_VENDOR_LIBRARY_NAME=mesa LIBGL_ALWAYS_SOFTWARE=1
-          xvfb-run -a glxinfo -B | grep -E 'OpenGL (vendor|renderer|version)'
-          # must NOT be the distro's stock Mesa any more
-          if xvfb-run -a glxinfo -B | grep -q "Mesa 26.0."; then echo "still the distro Mesa" >&2; exit 1; fi
+          GL="$( xvfb-run -a glxinfo -B | grep 'OpenGL version' )"
+          case "$GL" in *'Mesa 26.0.'*) echo "the fix is not in this build: $GL" >&2 ; exit 1 ;; esac
 
       - name: Package
         run: |
@@ -107,8 +99,7 @@ jobs:
           ASSET="mesa-llvmpipe-$( echo "$MESA_REF" | cut -c1-7 )-ubuntu26-$(uname -m).tar.gz"
           tar -C /opt -czf "/tmp/$ASSET" "$(basename "$PREFIX")"
           # sidecar names the tarball itself, so `sha256sum -c` works next to it
-          cd /tmp && sha256sum "$ASSET" | tee "$ASSET.sha256"
-          ls -l "/tmp/$ASSET"
+          cd /tmp && sha256sum "$ASSET" > "$ASSET.sha256"
 
       - name: Upload
         uses: actions/upload-artifact@v7
