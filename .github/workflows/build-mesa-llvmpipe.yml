@@ -1,0 +1,109 @@
+name: Build Mesa llvmpipe for Ubuntu 26.04
+
+# Ubuntu 26.04 ships Mesa 26.0.8, which mis-reads gl_PrimitiveID in a fragment shader that
+# also has user varyings and no geometry shader (mesa#15660): MeshInspector picks garbage
+# faces and crashes. The fix, mesa!42967, landed on Mesa main seven days after the 26.2
+# branch point, so no Mesa release carries it - hence this build.
+#
+# llvmpipe only, against Resolute's own llvm-21-dev (the same LLVM 21.1.8 its stock llvmpipe
+# uses), built in an ubuntu:26.04 container so glibc, libdrm, libglvnd and X11 all match the
+# image that consumes it. Retire this once a Mesa >= 26.3 reaches the archive or kisak-mesa.
+
+on:
+  push:
+    # not on main: merging must not restart the builds; run from the Actions tab instead
+    branches-ignore: [ main ]
+    paths: [ '.github/workflows/build-mesa-llvmpipe.yml' ]
+  workflow_dispatch:
+    inputs:
+      mesa_ref:
+        description: Mesa commit to build
+        default: 77251a488e9157ed450b3ff93a3d97390625d5b9
+        type: string
+      extra_meson:
+        description: Extra meson setup arguments
+        default: ''
+        type: string
+
+concurrency:
+  group: build-mesa-llvmpipe-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # mesa!42967 "llvmpipe: emit FS input vertex attributes in driver location order"
+  MESA_REF: ${{ inputs.mesa_ref || '77251a488e9157ed450b3ff93a3d97390625d5b9' }}
+  PREFIX: /opt/mesa-llvmpipe
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            os: ubuntu-latest
+          - arch: arm64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    container:
+      image: ubuntu:26.04
+    timeout-minutes: 90
+    steps:
+      - name: Install build dependencies
+        run: |
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qqy
+          apt-get install -qqy --no-install-recommends ca-certificates git curl xz-utils pkg-config build-essential meson ninja-build bison flex python3-mako python3-yaml python3-setuptools llvm-21-dev libclang-cpp21-dev libglvnd-dev libdrm-dev libudev-dev libexpat1-dev zlib1g-dev libzstd-dev libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev libxdamage-dev libxshmfence-dev libxxf86vm-dev libxrandr-dev libxcb-dri3-dev libxcb-present-dev libxcb-sync-dev libxcb-glx0-dev libxcb-shm0-dev libxcb-randr0-dev
+
+      - name: Fetch the Mesa sources
+        run: |
+          set -eux
+          mkdir -p /tmp/mesa && cd /tmp/mesa
+          git init -q
+          git remote add origin https://gitlab.freedesktop.org/mesa/mesa.git
+          git fetch -q --depth 1 origin "$MESA_REF"
+          git checkout -q FETCH_HEAD
+          git log -1 --format='%H %s'
+          # mesa!42967's head commit; its own subject is the nir change that carries the fix
+          test "$( git rev-parse HEAD )" = "$MESA_REF"
+
+      - name: Configure
+        run: |
+          set -eux
+          cd /tmp/mesa
+          meson setup build --prefix "$PREFIX" --buildtype release -Dgallium-drivers=llvmpipe -Dvulkan-drivers= -Dplatforms=x11 -Dglx=dri -Degl=enabled -Dgbm=enabled -Dglvnd=true -Dllvm=enabled -Dshared-llvm=enabled -Dtools= -Dvideo-codecs= ${{ inputs.extra_meson }}
+
+      - name: Build and install
+        run: |
+          set -eux
+          cd /tmp/mesa
+          ninja -C build
+          ninja -C build install
+
+      - name: Smoke test the stack
+        run: |
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get install -qqy --no-install-recommends mesa-utils xvfb
+          # ours: libglvnd stays the distro's, the vendor libs and the DRI module are ours
+          export LD_LIBRARY_PATH="$PREFIX/lib/$(uname -m)-linux-gnu:$PREFIX/lib"
+          export LIBGL_DRIVERS_PATH="$PREFIX/lib/$(uname -m)-linux-gnu/dri:$PREFIX/lib/dri"
+          export __GLX_VENDOR_LIBRARY_NAME=mesa LIBGL_ALWAYS_SOFTWARE=1
+          GL="$( xvfb-run -a glxinfo -B | grep 'OpenGL version' )"
+          case "$GL" in *'Mesa 26.0.'*) echo "the fix is not in this build: $GL" >&2 ; exit 1 ;; esac
+
+      - name: Package
+        run: |
+          set -eux
+          ASSET="mesa-llvmpipe-$( echo "$MESA_REF" | cut -c1-7 )-ubuntu26-$(uname -m).tar.gz"
+          tar -C /opt -czf "/tmp/$ASSET" "$(basename "$PREFIX")"
+          # sidecar names the tarball itself, so `sha256sum -c` works next to it
+          cd /tmp && sha256sum "$ASSET" > "$ASSET.sha256"
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: mesa-llvmpipe-ubuntu26-${{ matrix.arch }}
+          path: /tmp/mesa-llvmpipe-*-ubuntu26-*
+          if-no-files-found: error
