@@ -54,7 +54,7 @@ jobs:
           set -eux
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qqy
-          apt-get install -qqy --no-install-recommends ca-certificates git curl xz-utils pkg-config build-essential meson ninja-build bison flex python3-mako python3-yaml python3-setuptools llvm-21-dev libclang-cpp21-dev libdrm-dev libexpat1-dev zlib1g-dev libzstd-dev libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev libxdamage-dev libxshmfence-dev libxxf86vm-dev libxrandr-dev libxcb-dri3-dev libxcb-present-dev libxcb-sync-dev libxcb-glx0-dev libxcb-shm0-dev libxcb-randr0-dev
+          apt-get install -qqy --no-install-recommends ca-certificates git curl xz-utils pkg-config build-essential meson ninja-build bison flex python3-mako python3-yaml python3-setuptools llvm-21-dev libclang-cpp21-dev libglvnd-dev libdrm-dev libudev-dev libexpat1-dev zlib1g-dev libzstd-dev libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev libxdamage-dev libxshmfence-dev libxxf86vm-dev libxrandr-dev libxcb-dri3-dev libxcb-present-dev libxcb-sync-dev libxcb-glx0-dev libxcb-shm0-dev libxcb-randr0-dev
           meson --version
           llvm-config-21 --version
 
