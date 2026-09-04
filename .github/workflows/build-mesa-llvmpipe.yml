@@ -104,7 +104,7 @@ jobs:
       - name: Package
         run: |
           set -eux
-          ASSET="mesa-llvmpipe-ubuntu26-$(uname -m).tar.gz"
+          ASSET="mesa-llvmpipe-$( echo "$MESA_REF" | cut -c1-7 )-ubuntu26-$(uname -m).tar.gz"
           tar -C /opt -czf "/tmp/$ASSET" "$(basename "$PREFIX")"
           # sidecar names the tarball itself, so `sha256sum -c` works next to it
           cd /tmp && sha256sum "$ASSET" | tee "$ASSET.sha256"
@@ -114,5 +114,5 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: mesa-llvmpipe-ubuntu26-${{ matrix.arch }}
-          path: /tmp/mesa-llvmpipe-ubuntu26-*
+          path: /tmp/mesa-llvmpipe-*-ubuntu26-*
           if-no-files-found: error

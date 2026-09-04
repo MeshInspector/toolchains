@@ -248,6 +248,52 @@ against the Homebrew `lld` each machine had:
 Ordinary dylib links of 0.1-0.4 s show no difference at all; the gain is in
 ThinLTO codegen, which is what the profile covers.
 
+## Mesa 26.3.0-devel llvmpipe (Ubuntu 26.04) — `mesa-llvmpipe-77251a4-ubuntu26`
+
+Ubuntu 26.04 ships Mesa 26.0.8, which mis-reads `gl_PrimitiveID` in a fragment
+shader that also has user varyings and no geometry shader
+([mesa#15660](https://gitlab.freedesktop.org/mesa/mesa/-/issues/15660)).
+MeshInspector's picker is exactly that combination, so it picks garbage faces and
+crashes. The fix
+([mesa!42967](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/42967),
+head `77251a488e9157ed450b3ff93a3d97390625d5b9`) reached Mesa `main` seven days
+after the 26.2 branch point and was never nominated for stable — it is in one
+branch and zero tags, so no Mesa release and no PPA has it, `kisak-mesa` for
+resolute included. Hence this build.
+
+llvmpipe only, no Vulkan, no video codecs, no tools: 25 MB installed, ~6 MB
+compressed. Built in an `ubuntu:26.04` container against Resolute's own
+`llvm-21-dev` (1:21.1.8, the same LLVM its stock llvmpipe links), so glibc,
+libdrm, libglvnd and X11 match the image that consumes it. Takes 6 min on x64 and
+3 min on arm64.
+
+libglvnd stays the distro's; this supplies the vendor libraries and the DRI
+module, selected per process by three env vars:
+
+    TOOLCHAIN=mesa-llvmpipe-77251a4-ubuntu26
+    curl -fsSL "https://github.com/MeshInspector/toolchains/releases/download/${TOOLCHAIN}/${TOOLCHAIN}-$(uname -m).tar.gz" | tar -C /opt -xz
+
+    export LD_LIBRARY_PATH="/opt/mesa-llvmpipe/lib/$(uname -m)-linux-gnu:/opt/mesa-llvmpipe/lib"
+    export LIBGL_DRIVERS_PATH="/opt/mesa-llvmpipe/lib/$(uname -m)-linux-gnu/dri:/opt/mesa-llvmpipe/lib/dri"
+    export __GLX_VENDOR_LIBRARY_NAME=mesa LIBGL_ALWAYS_SOFTWARE=1
+
+Check that it took effect — the version must not say 26.0:
+
+    glxinfo -B | grep 'OpenGL version'
+    # OpenGL version string: 4.6 (Compatibility Profile) Mesa 26.3.0-devel (git-77251a488e)
+
+sha256 of the tarballs:
+
+    ee0783eb22ef1badf021353ab82b5cbb3cda36645cc00c8ceeba3b689b91138f  mesa-llvmpipe-77251a4-ubuntu26-x86_64.tar.gz
+    92c78c2c12de9dfc32c6b14b4504703580b4fdbc682b5ddb3bd2ca5afbfb0deb  mesa-llvmpipe-77251a4-ubuntu26-aarch64.tar.gz
+
+Each has a `.sha256` sidecar naming the tarball itself, so `sha256sum -c` next to
+it just works.
+
+**Retire this** once a Mesa >= 26.3 reaches the Ubuntu archive or kisak-mesa. The
+commit is in the tag deliberately: an image pinned by content checksum must not
+silently acquire a different driver.
+
 ## Who consumes these
 
 - `docker/rockylinux8-vcpkgDockerfile` in our Linux images fetches the Linux
@@ -260,6 +306,10 @@ ThinLTO codegen, which is what the profile covers.
   `our-macos-15`) carry the PGO `ld64.lld` inside their own kegs, installed once
   by the workflow below, so MeshInspector builds link with it without
   downloading anything per job.
+
+- The Ubuntu 26.04 CI images will fetch the Mesa llvmpipe tarball into `/opt` and
+  set the three env vars above, so headless GL in those containers renders with a
+  driver that has the `gl_PrimitiveID` fix.
 
 ## Rebuilding
 
@@ -289,6 +339,13 @@ and re-runnable by hand:
   on each self-hosted runner. It is checksum-verified and idempotent; re-run it
   after a machine is reimaged or its keg is rebuilt, since either wipes the keg's
   `bin`.
+
+Mesa is a single job per arch in
+[`.github/workflows/build-mesa-llvmpipe.yml`](.github/workflows/build-mesa-llvmpipe.yml),
+triggered by pushing to its file on any branch but `main`, with the Mesa commit as
+a dispatch input. It smoke-tests the result through `glxinfo` under xvfb and fails
+if the reported version is still the distro's, so a build that does not take
+effect cannot be published. 6 min x64, 3 min arm64.
 
 The macOS kegs are built on the self-hosted macOS runners by
 `brew install --build-bottle` from a local tap, then packed straight out of the
