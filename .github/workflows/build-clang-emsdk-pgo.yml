@@ -89,9 +89,9 @@ jobs:
       # clang cannot even serve as the bootstrap compiler: the arm64 one is
       # cross-built for wasm and reports its own host target as 'unknown', so
       # stage1 is built with the distro gcc, as in our other PGO recipes.
-      - name: Cache stage1
+      - name: Restore stage1
         id: stage1-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: /opt/stage1
           key: stage1-${{ matrix.arch }}-${{ env.LLVM_SHA }}-gcc
@@ -119,6 +119,16 @@ jobs:
           find /opt/stage1/lib/clang -name 'libclang_rt.profile*' | grep .
           df -h / | tail -1
 
+      # actions/cache saves in a post step declared post-if: success(), so any
+      # later failure in this job threw away the two hours stage1 costs. Save it
+      # explicitly the moment it exists instead.
+      - name: Save stage1
+        if: steps.stage1-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /opt/stage1
+          key: stage1-${{ matrix.arch }}-${{ env.LLVM_SHA }}-gcc
+
       - name: Stage 2 instrumented (IR-PGO)
         run: |
           set -euo pipefail
@@ -141,6 +151,32 @@ jobs:
           ./stage2i/bin/clang --version | head -1
           ./stage2i/bin/clang -print-targets | grep -i wasm
           df -h / | tail -1
+
+      # emscripten 6.0.x added libopenmp to the system libraries, and it does not
+      # build for wasm64: kmp_platform.h only recognises __wasm32__, so
+      # `embuilder build SYSTEM --wasm64` fails the same way with the image's own
+      # stock clang (emscripten-core/emscripten#27221). Upstream's answer is to
+      # skip the library under MEMORY64, and that landed after 6.0.9 was cut, so
+      # apply the same guard to the image. wasm32 still trains on libopenmp.
+      # Delete this step once emsdk ships emscripten-core/emscripten@14a8c99.
+      - name: Skip libopenmp for wasm64 (emscripten#27221)
+        run: |
+          set -euo pipefail
+          python3 - /emsdk/upstream/emscripten/tools/system_libs.py <<'PY'
+          import sys
+          path = sys.argv[1]
+          src = open(path).read()
+          head, sep, tail = src.partition('\n\ndef get_libs_to_link():')
+          assert sep, 'get_libs_to_link anchor missing'
+          last = head[head.rindex('\nclass '):]
+          assert last.startswith('\nclass libopenmp(Library):'), 'libopenmp is not the last class'
+          guard = ('\n\n  def can_build(self):\n'
+                   '    # emscripten-core/emscripten#27221\n'
+                   '    return super().can_build() and not settings.MEMORY64\n')
+          open(path, 'w').write(head + guard + sep + tail)
+          PY
+          sed -n '/^class libopenmp/,/^def get_libs_to_link/p' \
+            /emsdk/upstream/emscripten/tools/system_libs.py | tail -5
 
       # Training has two halves: the wasm half (emscripten's own system
       # libraries, wasm32 and wasm64, through the image's embuilder) covers the
@@ -170,7 +206,11 @@ jobs:
           }
           embuilder build SYSTEM --force
           harvest wasm32
-          embuilder build SYSTEM --force --wasm64
+          embuilder build SYSTEM --force --wasm64 2>&1 | tee /tmp/w64.log
+          if grep -m1 '^Building targets:' /tmp/w64.log | grep -qw libopenmp; then
+            echo 'the wasm64 target list still contains libopenmp' >&2
+            exit 1
+          fi
           harvest wasm64
           cmake -G Ninja -S llvm-project/llvm -B train \
             -DCMAKE_C_COMPILER=$PWD/stage2i/bin/clang \
@@ -296,8 +336,7 @@ jobs:
           set -euo pipefail
           NAME="${TAG}-$(uname -m).tar.gz"
           tar -C /opt -czf "/tmp/${NAME}" "${PREFIX}"
-          cd /tmp
-          sha256sum "${NAME}" | tee "${NAME}.sha256"
+          ( cd /tmp && sha256sum "${NAME}" | tee "${NAME}.sha256" )
           ls -la "/tmp/${NAME}"
 
       - name: Upload toolchain artifact
@@ -412,6 +451,6 @@ jobs:
           cat "/tmp/${NAME}.sha256"
           gh release create "${TAG}" -R "$GITHUB_REPOSITORY" \
             --title "clang 24.0.0git PGO for emsdk ${EMSDK_VER}" \
-            --notes "Drop-in replacement for /emsdk/upstream/bin in emscripten/emsdk:${EMSDK_VER}: the same llvm-project revision emsdk ships (${LLVM_SHA}, clang 24.0.0git), rebuilt with -O3 + IR-PGO + ThinLTO instead of upstream's ThinLTO-only release configuration. Built inside the emscripten/emsdk:${EMSDK_VER} image itself (Ubuntu noble, glibc 2.39 - emsdk moved off jammy after the 4.x line). Training: emscripten system libraries for wasm32 and wasm64 via embuilder, plus a slice of LLVM itself for the frontend and middle-end. Install prefix inside the tarball: ${PREFIX}/." \
+            --notes "Drop-in replacement for /emsdk/upstream/bin in emscripten/emsdk:${EMSDK_VER}: the same llvm-project revision emsdk ships (${LLVM_SHA}, clang 24.0.0git), rebuilt with -O3 + IR-PGO + ThinLTO instead of upstream's ThinLTO-only release configuration. Built inside the emscripten/emsdk:${EMSDK_VER} image itself (Ubuntu noble, glibc 2.39 - emsdk moved off jammy after the 4.x line). Training: emscripten system libraries for wasm32 and wasm64 via embuilder (wasm64 minus libopenmp, which has no wasm64 support upstream), plus a slice of LLVM itself for the frontend and middle-end. Install prefix inside the tarball: ${PREFIX}/." \
             2>/dev/null || echo "release exists"
           gh release upload "${TAG}" -R "$GITHUB_REPOSITORY" --clobber "/tmp/${NAME}" "/tmp/${NAME}.sha256"
