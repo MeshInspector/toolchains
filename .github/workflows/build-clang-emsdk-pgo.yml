@@ -1,9 +1,9 @@
 name: Build clang emsdk PGO
 
 # Build the *Emscripten* clang with -O3 + IR-PGO + ThinLTO, i.e. the same
-# llvm-project revision that emsdk 4.0.19 ships (12f392cff, clang 22.0.0git),
+# llvm-project revision that emsdk 5.0.7 ships (7b58716d9, clang 23.0.0git),
 # so the result is a drop-in replacement for /emsdk/upstream/bin in the
-# emscripten/emsdk:4.0.19 images. Upstream (emscripten-releases src/build.py)
+# emscripten/emsdk:5.0.7 images. Upstream (emscripten-releases src/build.py)
 # builds that toolchain with ThinLTO but no PGO; this recipe adds the PGO.
 #
 # Everything runs inside the target image itself, so the produced binaries are
@@ -17,7 +17,7 @@ name: Build clang emsdk PGO
 
 on:
   push:
-    branches: [ clang-emsdk-4.0.19-pgo ]
+    branches: [ clang-emsdk-5.0.7-pgo ]
   workflow_dispatch:
     inputs:
       reuse_run_id:
@@ -26,11 +26,11 @@ on:
         default: ""
 
 env:
-  EMSDK_VER: 4.0.19
-  # llvm_project_revision from emscripten-releases DEPS at the 4.0.19 tag
-  LLVM_SHA: 12f392cff10fcc70b4ec4f01ab386922742e9136
-  PREFIX: llvm-emsdk-4.0.19-pgo
-  TAG: clang-emsdk-4.0.19-pgo
+  EMSDK_VER: 5.0.7
+  # llvm_project_revision from emscripten-releases DEPS at the 5.0.7 tag
+  LLVM_SHA: 7b58716d96c3ae4c0c4e6f72e29b16137bb6224b
+  PREFIX: llvm-emsdk-5.0.7-pgo
+  TAG: clang-emsdk-5.0.7-pgo
   # upstream's toolchain tool list (emscripten-releases src/build.py), minus the
   # clang-tools-extra entries (clangd, clang-scan-deps) that emscripten never calls
   TOOLS: clang;lld;llvm-ar;llvm-addr2line;llvm-cov;llvm-cxxfilt;llvm-dwarfdump;llvm-dwp;llvm-nm;llvm-objcopy;llvm-objdump;llvm-profdata;llvm-ranlib;llvm-readobj;llvm-size;llvm-strings;llvm-strip;llvm-symbolizer;clang-resource-headers
@@ -43,10 +43,10 @@ jobs:
         include:
           - arch: x64
             runner: ubuntu-24.04
-            image: emscripten/emsdk:4.0.19
+            image: emscripten/emsdk:5.0.7
           - arch: arm64
             runner: ubuntu-24.04-arm
-            image: emscripten/emsdk:4.0.19-arm64
+            image: emscripten/emsdk:5.0.7-arm64
     if: ${{ inputs.reuse_run_id == '' }}
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.image }}
@@ -215,10 +215,10 @@ jobs:
         include:
           - arch: x64
             runner: ubuntu-24.04
-            image: emscripten/emsdk:4.0.19
+            image: emscripten/emsdk:5.0.7
           - arch: arm64
             runner: ubuntu-24.04-arm
-            image: emscripten/emsdk:4.0.19-arm64
+            image: emscripten/emsdk:5.0.7-arm64
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.image }}
     timeout-minutes: 350
@@ -313,7 +313,7 @@ jobs:
       - name: Validate against the image's emscripten
         run: |
           set -euo pipefail
-          test -d /emsdk/upstream/lib/clang/22
+          test -d /emsdk/upstream/lib/clang/23
           node --version
           export EM_CACHE=/tmp/emcache-pgo
           printf '#include <cstdio>\n#include <vector>\n#include <algorithm>\nint main(){std::vector<int> v{5,3,1,4,2};std::sort(v.begin(),v.end());for(int x:v)std::printf("%%d",x);std::printf("\\n");}\n' > /tmp/t.cpp
@@ -394,7 +394,7 @@ jobs:
             echo
             echo "| toolchain | time |"
             echo "| --- | --- |"
-            echo "| stock emsdk 4.0.19 clang (ThinLTO, no PGO) | ${STOCK} ms |"
+            echo "| stock emsdk 5.0.7 clang (ThinLTO, no PGO) | ${STOCK} ms |"
             echo "| this build (-O3 + PGO + ThinLTO) | ${PGO} ms |"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -411,7 +411,7 @@ jobs:
           NAME="${TAG}-$(uname -m).tar.gz"
           cat "/tmp/${NAME}.sha256"
           gh release create "${TAG}" -R "$GITHUB_REPOSITORY" \
-            --title "clang 22.0.0git PGO for emsdk ${EMSDK_VER}" \
-            --notes "Drop-in replacement for /emsdk/upstream/bin in emscripten/emsdk:${EMSDK_VER}: the same llvm-project revision emsdk ships (${LLVM_SHA}, clang 22.0.0git), rebuilt with -O3 + IR-PGO + ThinLTO instead of upstream's ThinLTO-only release configuration. Built inside the emscripten/emsdk:${EMSDK_VER} image itself (Ubuntu jammy, glibc 2.35). Training: emscripten system libraries for wasm32 and wasm64 via embuilder, plus a slice of LLVM itself for the frontend and middle-end. Install prefix inside the tarball: ${PREFIX}/." \
+            --title "clang 23.0.0git PGO for emsdk ${EMSDK_VER}" \
+            --notes "Drop-in replacement for /emsdk/upstream/bin in emscripten/emsdk:${EMSDK_VER}: the same llvm-project revision emsdk ships (${LLVM_SHA}, clang 23.0.0git), rebuilt with -O3 + IR-PGO + ThinLTO instead of upstream's ThinLTO-only release configuration. Built inside the emscripten/emsdk:${EMSDK_VER} image itself (Ubuntu noble, glibc 2.39 - emsdk moved off jammy after the 4.x line). Training: emscripten system libraries for wasm32 and wasm64 via embuilder, plus a slice of LLVM itself for the frontend and middle-end. Install prefix inside the tarball: ${PREFIX}/." \
             2>/dev/null || echo "release exists"
           gh release upload "${TAG}" -R "$GITHUB_REPOSITORY" --clobber "/tmp/${NAME}" "/tmp/${NAME}.sha256"
