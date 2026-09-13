@@ -14,6 +14,8 @@ URL that `curl` can fetch anonymously.
 | Tag | Platform | Archs | Unpacks to | Size | Status |
 | --- | --- | --- | --- | --- | --- |
 | [`clang-22.1.8-pgo-dylib-linux`](https://github.com/MeshInspector/toolchains/releases/tag/clang-22.1.8-pgo-dylib-linux) | Linux, glibc >= 2.28 | `x86_64`, `aarch64` | `llvm-pgo-dylib-22.1.8/` | ~185 MB | **current** |
+| [`clang-emsdk-6.0.9-pgo`](https://github.com/MeshInspector/toolchains/releases/tag/clang-emsdk-6.0.9-pgo) | `emscripten/emsdk:6.0.9` (noble, glibc >= 2.39) | `x86_64`, `aarch64` | `llvm-emsdk-6.0.9-pgo/` | ~114 MB | ready, unused |
+| [`clang-emsdk-5.0.7-pgo`](https://github.com/MeshInspector/toolchains/releases/tag/clang-emsdk-5.0.7-pgo) | `emscripten/emsdk:5.0.7` (noble, glibc >= 2.39) | `x86_64`, `aarch64` | `llvm-emsdk-5.0.7-pgo/` | ~126 MB | pending bump |
 | [`clang-emsdk-4.0.19-pgo`](https://github.com/MeshInspector/toolchains/releases/tag/clang-emsdk-4.0.19-pgo) | `emscripten/emsdk:4.0.19` (jammy, glibc >= 2.35) | `x86_64`, `aarch64` | `llvm-emsdk-4.0.19-pgo/` | ~114 MB | **current** |
 | [`clang-18.1.8-pgo-dylib-linux`](https://github.com/MeshInspector/toolchains/releases/tag/clang-18.1.8-pgo-dylib-linux) | Linux, glibc >= 2.28 | `x86_64`, `aarch64` | `llvm-pgo-dylib-18.1.8/` | ~178 MB | **current** |
 | [`clang-22.1.8-pgo-rockylinux8`](https://github.com/MeshInspector/toolchains/releases/tag/clang-22.1.8-pgo-rockylinux8) | Linux, glibc >= 2.28 | `x64`, `arm64` | `llvm-pgo-22.1.8/` | ~1 GB | superseded |
@@ -32,56 +34,85 @@ is how `clang-22.1.8-pgo-dylib-rockylinux8` became `clang-22.1.8-pgo-dylib-linux
 which 404s the old URLs. Pin the tag in exactly one place per consumer so a
 rename stays a one-line fix.
 
-## clang for Emscripten, PGO — `clang-emsdk-4.0.19-pgo`
+## clang for Emscripten, PGO — `clang-emsdk-<version>-pgo`
 
-The compiler `emscripten/emsdk:4.0.19` ships, rebuilt with PGO. Upstream builds
+The compiler an `emscripten/emsdk` image ships, rebuilt with PGO. Upstream builds
 that toolchain with ThinLTO and assertions off but **no PGO** at all
 (`emscripten-releases` `src/build.py` has no `LLVM_BUILD_INSTRUMENTED`, no
 `LLVM_PROFDATA_FILE`, no BOLT), so this is `-O3` + IR-PGO + ThinLTO on top of the
 same configuration.
 
-It is the **same llvm-project revision emsdk pins**, `12f392cff` /
-`clang version 22.0.0git`, read out of the emscripten-releases `DEPS` for the
-4.0.19 tag. That matters: it keeps emcc's `EXPECTED_LLVM_VERSION = 22` check
-satisfied and keeps the image's prebuilt wasm sysroot and resource headers
-valid, so dropping it in is a compiler swap and nothing else.
+Each build is the **same llvm-project revision emsdk pins**, read out of the
+emscripten-releases `DEPS` for that version's tag. That matters: it keeps emcc's
+`EXPECTED_LLVM_VERSION` check satisfied and keeps the image's prebuilt wasm sysroot
+and resource headers valid, so dropping it in is a compiler swap and nothing else.
+
+| Tag | Image | llvm-project revision | clang | Resource dir | Base |
+| --- | --- | --- | --- | --- | --- |
+| `clang-emsdk-6.0.9-pgo` | `emscripten/emsdk:6.0.9` | `b158b0ae6` | 24.0.0git | `lib/clang/24` | noble, glibc 2.39 |
+| `clang-emsdk-5.0.7-pgo` | `emscripten/emsdk:5.0.7` | `7b58716d9` | 23.0.0git | `lib/clang/23` | noble, glibc 2.39 |
+| `clang-emsdk-4.0.19-pgo` | `emscripten/emsdk:4.0.19` | `12f392cff` | 22.0.0git | `lib/clang/22` | jammy, glibc 2.35 |
+
+A tarball only matches the image it was built from — the clang major has to be the
+one that image's emcc expects, so pick the row for the emsdk you actually run.
 
 Point emscripten at it with `EM_LLVM_ROOT` — emscripten honours `EM_<KEY>` for
 any config key, so nothing under `/emsdk` has to be modified:
 
-    TOOLCHAIN=clang-emsdk-4.0.19-pgo
+    VER=6.0.9
+    TOOLCHAIN=clang-emsdk-${VER}-pgo
     curl -fsSL --retry 5 --retry-all-errors "https://github.com/MeshInspector/toolchains/releases/download/${TOOLCHAIN}/${TOOLCHAIN}-$(uname -m).tar.gz" | tar -C /opt -xz
-    export EM_LLVM_ROOT=/opt/llvm-emsdk-4.0.19-pgo/bin
+    export EM_LLVM_ROOT=/opt/llvm-emsdk-${VER}-pgo/bin
     emcc --version
 
-Compile time against the stock emsdk compiler, same runner, template-heavy
+Compile time against each image's own stock compiler, same runner, template-heavy
 translation unit, `em++ -O3 -std=c++20 -c`, min of 5 with both caches warm:
 
-| arch | stock emsdk clang | this toolchain | delta |
-| --- | --- | --- | --- |
-| `x86_64` | 1647 ms | 1336 ms | **-18.9%** |
-| `aarch64` | 2159 ms | 1670 ms | **-22.6%** |
+| Version | arch | stock emsdk clang | this toolchain | delta |
+| --- | --- | --- | --- | --- |
+| 6.0.9 | `x86_64` | 2096 ms | 1546 ms | **-26.2%** |
+| 6.0.9 | `aarch64` | 2100 ms | 1622 ms | **-22.8%** |
+| 5.0.7 | `x86_64` | 2071 ms | 1591 ms | **-23.2%** |
+| 5.0.7 | `aarch64` | 2035 ms | 1600 ms | **-21.4%** |
+| 4.0.19 | `x86_64` | 1647 ms | 1336 ms | **-18.9%** |
+| 4.0.19 | `aarch64` | 2159 ms | 1670 ms | **-22.6%** |
 
-sha256 of the tarballs:
+The stock numbers are not comparable across versions: 6.0.9 and 5.0.7 were measured
+on noble images and 4.0.19 on jammy, and each row's stock and PGO figures come from
+the same job on the same runner. Only the delta within a row means anything.
 
+Every tarball has a `.sha256` sidecar naming the tarball itself, so `sha256sum -c`
+works on a plain side-by-side download:
+
+    f8301b45b568b15036eb91ec02551ed4333b525cd0f18b5ff11686b7171ed910  clang-emsdk-6.0.9-pgo-x86_64.tar.gz
+    bb0456e662730595f801ad55b66f98d1dc5682e7ab6fcb6f129cd0ceb3528d4c  clang-emsdk-6.0.9-pgo-aarch64.tar.gz
+    7fab2d60f41bb6ac9f4d7c682d71ba9821c877c8be01489307e4f42a3d362002  clang-emsdk-5.0.7-pgo-x86_64.tar.gz
+    57a6f326b6bf92aff8788ad3a0d57ca6d0334a73434c73645762a3552a58aafe  clang-emsdk-5.0.7-pgo-aarch64.tar.gz
     65c70c0d997a9ab6a82c8ea6af5c69f46ac64bc96bd8816a3a29f445c7edc21d  clang-emsdk-4.0.19-pgo-x86_64.tar.gz
     a740be411d2333189f28783af80a35b9efcbcabcdb5ef2ebd5d0650c9d9b764a  clang-emsdk-4.0.19-pgo-aarch64.tar.gz
 
-Two things to know before reusing this recipe for another emsdk version:
+Three things to know before reusing this recipe for another emsdk version:
 
 * It is built **inside the target image**, not in `rockylinux:8` like the kegs
-  above, so the glibc floor is jammy's 2.35 rather than 2.28. That is deliberate:
-  the training step drives the image's own `embuilder` to profile the real
-  WebAssembly code paths (system libraries for wasm32 *and* wasm64), alongside a
-  slice of LLVM itself for the frontend and middle-end.
+  above, so the glibc floor is that image's, not 2.28 — jammy's 2.35 for 4.0.19 and
+  noble's 2.39 from 5.x on. That is deliberate: the training step drives the image's
+  own `embuilder` to profile the real WebAssembly code paths (system libraries for
+  wasm32 *and* wasm64), alongside a slice of LLVM itself for the frontend and
+  middle-end.
 * The emsdk clang cannot bootstrap it. Its compiler-rt is wasm-only, so it
   cannot link `-fprofile-generate` binaries, and the arm64 one reports its own
   host target as `unknown` because it is cross-built — a native CMake configure
   with it fails outright. The recipe therefore builds a stage1 clang with the
   distro gcc first.
+* emscripten 6.0.x added `libopenmp` to its system libraries and it does not build
+  for wasm64 at all ([emscripten#27221](https://github.com/emscripten-core/emscripten/issues/27221)),
+  which breaks `embuilder build SYSTEM --wasm64` with the image's own stock clang
+  too. Upstream's fix — skip the library under `MEMORY64` — landed after 6.0.9 was
+  cut, so the 6.0.9 recipe applies that same guard to the image before training.
+  Drop that step once emsdk ships a release containing it.
 
-Only the `bin/` tree is needed by emscripten; the tarball also carries
-`lib/clang/22` from the same revision, which is why overlaying it onto
+Only the `bin/` tree is needed by emscripten; the tarball also carries the matching
+`lib/clang/<major>` from the same revision, which is why overlaying it onto
 `/emsdk/upstream` works too if `EM_LLVM_ROOT` is inconvenient.
 
 ## clang 22.1.8 PGO dylib (Linux) — `clang-22.1.8-pgo-dylib-linux`
@@ -280,6 +311,10 @@ sha256 of the tarballs:
 - `docker/rockylinux8-vcpkgDockerfile` in our Linux images fetches the Linux
   dylib keg into `/opt`. The version is pinned by the single
   `TOOLCHAIN=` line there, plus one `LLVM_PREFIX` env per workflow.
+- MeshLib `docker/emscriptenDockerfile` untars the emsdk toolchain straight over
+  `/emsdk/upstream` (`--strip-components=1`) so emcc finds it with no `EM_LLVM_ROOT`,
+  and derives the tag from its one `EMSDK_VERSION=` line. `master` is on 4.0.19; the
+  pending emsdk bump moves that line, and the toolchain with it, to 5.0.7.
 - MeshLib `.github/workflows/build-test-macos.yml` and `pip-build.yml` install the
   macOS kegs on the GitHub-hosted runners through the composite action and use
   them for mrbind and the Python bindings.
@@ -304,6 +339,24 @@ per version, and pushing to that branch is what triggers the build:
 
 Budget roughly 3h of hosted-runner wall clock for a dylib build (18.1.8 took
 2h56m for all four jobs); the static+ThinLTO flavor took closer to 8h.
+
+The emsdk recipe follows the same branch-per-version rule, in
+`.github/workflows/build-clang-emsdk-pgo.yml`, but every job runs inside the target
+image so the version drives the container as well as the sources: `EMSDK_VER`,
+`LLVM_SHA`, `PREFIX`, `TAG`, the two `image:` entries and the `lib/clang/<major>`
+check in the validation step.
+
+- [`clang-emsdk-6.0.9-pgo`](https://github.com/MeshInspector/toolchains/tree/clang-emsdk-6.0.9-pgo),
+  [`clang-emsdk-5.0.7-pgo`](https://github.com/MeshInspector/toolchains/tree/clang-emsdk-5.0.7-pgo)
+  and [`clang-emsdk-4.0.19-pgo`](https://github.com/MeshInspector/toolchains/tree/clang-emsdk-4.0.19-pgo)
+  are the three built so far. `LLVM_SHA` comes from the emscripten-releases `DEPS`
+  at the version's tag, which
+  [`emscripten-releases-tags.json`](https://raw.githubusercontent.com/emscripten-core/emsdk/main/emscripten-releases-tags.json)
+  maps the version to.
+
+Budget 4-5h of hosted-runner wall clock (5.0.7 took 4h01m, 6.0.9 4h55m). Stage1 is
+cached per arch and revision and saved as soon as it is built, so a second attempt
+at the training or final steps starts from it instead of rebuilding LLVM.
 
 `ld64.lld` has two workflows of its own, both triggered by pushing to their file
 and re-runnable by hand:
