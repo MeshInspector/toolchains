@@ -1,6 +1,6 @@
 name: Build clang linux PGO
 
-# Build clang 22.1.8 with -O3 + PGO + ThinLTO for RockyLinux 8 (glibc 2.28),
+# Build clang and lld 22.1.8 with -O3 + PGO for RockyLinux 8 (glibc 2.28),
 # x64 and arm64, using the upstream 3-stage flow. Split into two chained jobs
 # per arch to stay under the 6h hosted-job cap. The final job publishes the
 # install tree to this repo's releases.
@@ -35,7 +35,7 @@ jobs:
           echo "install_weak_deps=false" >> /etc/dnf/dnf.conf
           dnf -y install 'dnf-command(config-manager)'
           dnf config-manager --set-enabled powertools
-          dnf -y install gcc-toolset-11 cmake ninja-build python3.12 git xz zlib-devel curl tar unzip binutils-devel
+          dnf -y install gcc-toolset-11 cmake ninja-build python3.12 git xz zlib-devel curl tar unzip binutils-devel findutils
 
       - name: Fetch sources
         run: |
@@ -62,13 +62,16 @@ jobs:
             -DCMAKE_C_COMPILER=/opt/stage1/bin/clang \
             -DCMAKE_CXX_COMPILER=/opt/stage1/bin/clang++ \
             -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
             -DLLVM_TARGETS_TO_BUILD=Native \
             -DLLVM_BUILD_INSTRUMENTED=IR \
             -DLLVM_BUILD_RUNTIME=No \
             -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF
-          ninja -C stage2i clang
-          # training: compile a slice of LLVM itself with the instrumented clang
+          ninja -C stage2i clang lld
+          # the name makes clang pass lld-style LTO options instead of loading LLVMgold.so
+          mkdir -p /tmp/bin-instr
+          cp stage2i/bin/lld /tmp/bin-instr/ld.lld
+          # clang training: compile a slice of LLVM itself with the instrumented clang
           export LLVM_PROFILE_FILE=/tmp/prof/%m-%p.profraw
           mkdir -p /tmp/prof
           cmake -G Ninja -S llvm-project/llvm -B train \
@@ -78,13 +81,44 @@ jobs:
             -DLLVM_TARGETS_TO_BUILD=Native \
             -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF
           ninja -C train LLVMSupport LLVMCore LLVMAnalysis
-          /opt/stage1/bin/llvm-profdata merge -output=/tmp/clang.profdata /tmp/prof/*.profraw
-          ls -la /tmp/clang.profdata
+          # the same Support sources as ThinLTO bitcode, for the lld training below
+          cmake -G Ninja -S llvm-project/llvm -B train-lto \
+            -DCMAKE_C_COMPILER=$PWD/stage2i/bin/clang \
+            -DCMAKE_CXX_COMPILER=$PWD/stage2i/bin/clang++ \
+            -DCMAKE_AR=/opt/stage1/bin/llvm-ar -DCMAKE_RANLIB=/opt/stage1/bin/llvm-ranlib \
+            -DCMAKE_C_FLAGS=-flto=thin -DCMAKE_CXX_FLAGS=-flto=thin \
+            -DCMAKE_EXE_LINKER_FLAGS=--ld-path=/opt/stage1/bin/ld.lld \
+            -DCMAKE_SHARED_LINKER_FLAGS=--ld-path=/opt/stage1/bin/ld.lld \
+            -DCMAKE_MODULE_LINKER_FLAGS=--ld-path=/opt/stage1/bin/ld.lld \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_TARGETS_TO_BUILD=Native \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF
+          ninja -C train-lto LLVMSupport
+          # lld training: link the Support objects into a shared library plainly and with
+          # ThinLTO, which is the shape of the MeshLib bindings links.
+          find train/lib/Support train/lib/Demangle -name '*.o' > /tmp/objs.txt
+          find train-lto/lib/Support train-lto/lib/Demangle -name '*.o' > /tmp/objs-lto.txt
+          wc -l /tmp/objs.txt /tmp/objs-lto.txt
+          # Without LLD_IN_TEST lld leaves via _exit(), skipping the profile writer.
+          export LLD_IN_TEST=1
+          n0=$( ls /tmp/prof | wc -l )
+          for i in 1 2 3 ; do
+            /opt/stage1/bin/clang++ -fuse-ld=lld --ld-path=/tmp/bin-instr/ld.lld -shared \
+              @/tmp/objs.txt -o /tmp/train.so
+            /opt/stage1/bin/clang++ -fuse-ld=lld --ld-path=/tmp/bin-instr/ld.lld -shared -Oz -flto=thin -s -Wl,--icf=all \
+              @/tmp/objs-lto.txt -o /tmp/train-lto.so
+          done
+          n1=$( ls /tmp/prof | wc -l )
+          echo "$(( n1 - n0 )) raw profiles from lld"
+          [[ $(( n1 - n0 )) -ge 1 ]] || { echo "the instrumented lld wrote no profile" >&2 ; exit 1 ; }
+          /opt/stage1/bin/llvm-profdata merge -output=/tmp/llvm.profdata /tmp/prof/*.profraw
+          ls -la /tmp/llvm.profdata
+          tar -czf /tmp/bench-objs.tar.gz -T /tmp/objs.txt -T /tmp/objs-lto.txt -C /tmp objs.txt objs-lto.txt
 
       - name: Pack stage artifacts
         run: |
           tar -C /opt -czf /tmp/stage1-${{ matrix.arch }}.tar.gz stage1
-          ls -la /tmp/stage1-${{ matrix.arch }}.tar.gz /tmp/clang.profdata
+          ls -la /tmp/stage1-${{ matrix.arch }}.tar.gz /tmp/llvm.profdata /tmp/bench-objs.tar.gz
 
       - name: Upload stage artifacts
         uses: actions/upload-artifact@v4
@@ -92,7 +126,8 @@ jobs:
           name: stage1-${{ matrix.arch }}
           path: |
             /tmp/stage1-${{ matrix.arch }}.tar.gz
-            /tmp/clang.profdata
+            /tmp/llvm.profdata
+            /tmp/bench-objs.tar.gz
           retention-days: 3
           compression-level: 0
 
@@ -120,7 +155,7 @@ jobs:
           echo "install_weak_deps=false" >> /etc/dnf/dnf.conf
           dnf -y install 'dnf-command(config-manager)'
           dnf config-manager --set-enabled powertools
-          dnf -y install gcc-toolset-11 cmake ninja-build python3.12 git xz zlib-devel curl tar unzip binutils-devel
+          dnf -y install gcc-toolset-11 cmake ninja-build python3.12 git xz zlib-devel curl tar unzip binutils-devel findutils
 
       - name: Fetch sources
         run: |
@@ -150,7 +185,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_ENABLE_PROJECTS="clang;lld" \
             -DLLVM_TARGETS_TO_BUILD=Native \
-            -DLLVM_PROFDATA_FILE=/tmp/clang.profdata \
+            -DLLVM_PROFDATA_FILE=/tmp/llvm.profdata \
             -DLLVM_ENABLE_RTTI=ON \
             -DLLVM_BUILD_LLVM_DYLIB=ON \
             -DLLVM_LINK_LLVM_DYLIB=ON \
@@ -161,6 +196,33 @@ jobs:
           /opt/llvm-pgo-dylib-22.1.8/bin/clang++ --version | head -n1
           ls /opt/llvm-pgo-dylib-22.1.8/lib/libLLVM.so /opt/llvm-pgo-dylib-22.1.8/lib/libclang-cpp.so
 
+      - name: Bench lld against the previous release's, min of 5 links each
+        run: |
+          mkdir -p /tmp/bench /tmp/old
+          tar -C /tmp/bench -xzf /tmp/bench-objs.tar.gz
+          curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/clang-22.1.8-pgo-dylib-linux/clang-22.1.8-pgo-dylib-linux-$( uname -m ).tar.gz" \
+            | tar -C /tmp/old -xz --wildcards 'llvm-pgo-dylib-22.1.8/bin/lld' 'llvm-pgo-dylib-22.1.8/lib/libLLVM.so*'
+          ln -s lld /tmp/old/llvm-pgo-dylib-22.1.8/bin/ld.lld
+          bench() # $1 = ld.lld, $2... = link arguments
+          {
+            local ld="$1" ; shift
+            TIMEFORMAT=%R
+            for i in 1 2 3 4 5 ; do
+              { time /opt/stage1/bin/clang++ -fuse-ld=lld --ld-path="$ld" -shared "$@" -o /tmp/bench.so >/dev/null 2>&1 ; } 2>&1
+            done | sort -n | head -n 1
+          }
+          cd /tmp/bench
+          OLD=/tmp/old/llvm-pgo-dylib-22.1.8/bin/ld.lld
+          NEW=/opt/llvm-pgo-dylib-22.1.8/bin/ld.lld
+          "$NEW" --version
+          # checked warm-up links: the timed ones below discard their errors
+          for ld in $OLD $NEW ; do
+            /opt/stage1/bin/clang++ -fuse-ld=lld --ld-path=$ld -shared @objs.txt -o /tmp/bench.so
+            /opt/stage1/bin/clang++ -fuse-ld=lld --ld-path=$ld -shared -Oz -flto=thin -s -Wl,--icf=all @objs-lto.txt -o /tmp/bench.so
+          done
+          echo "plain link:   old $( bench $OLD @objs.txt ) s, new $( bench $NEW @objs.txt ) s"
+          echo "ThinLTO link: old $( bench $OLD -Oz -flto=thin -s -Wl,--icf=all @objs-lto.txt ) s, new $( bench $NEW -Oz -flto=thin -s -Wl,--icf=all @objs-lto.txt ) s"
+
       - name: Pack and publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -168,11 +230,13 @@ jobs:
           dnf -y install 'dnf-command(config-manager)' >/dev/null 2>&1 || true
           dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
           dnf -y install gh
-          NAME="clang-22.1.8-pgo-dylib-rockylinux8-${{ matrix.arch }}.tar.gz"
+          # a new tag, so the consumers of clang-22.1.8-pgo-dylib-linux move to it explicitly
+          TAG=clang-22.1.8_2-pgo-dylib-linux
+          NAME="$TAG-$( uname -m ).tar.gz"
           tar -C /opt -czf "/tmp/$NAME" llvm-pgo-dylib-22.1.8
-          sha256sum "/tmp/$NAME" | tee "/tmp/$NAME.sha256"
-          gh release create clang-22.1.8-pgo-dylib-rockylinux8 -R "$GITHUB_REPOSITORY" \
-            --title "clang 22.1.8 PGO dylib (RockyLinux 8)" \
-            --notes "clang/lld 22.1.8 built with -O3 + IR-PGO (no LTO), RTTI, and distro-style libLLVM.so/libclang-cpp.so in a rockylinux:8 container (glibc 2.28). Stage1 gcc-toolset-11; training = compiling LLVMSupport/Core/Analysis. Install prefix inside the tarball: llvm-pgo-dylib-22.1.8/." \
+          ( cd /tmp && sha256sum "$NAME" | tee "$NAME.sha256" )
+          gh release create $TAG -R "$GITHUB_REPOSITORY" \
+            --title "clang 22.1.8 PGO dylib with PGO lld (Linux)" \
+            --notes "clang/lld 22.1.8 built with -O3 + IR-PGO (no LTO), RTTI, and distro-style libLLVM.so/libclang-cpp.so in a rockylinux:8 container (glibc 2.28). Stage1 gcc-toolset-11; training = compiling LLVMSupport/Core/Analysis, then linking the Support objects into a shared library with the instrumented lld, plainly and with -flto=thin -Wl,--icf=all. Unlike clang-22.1.8-pgo-dylib-linux, whose profile had no lld counts, lld is PGO-trained too. Install prefix inside the tarball: llvm-pgo-dylib-22.1.8/." \
             2>/dev/null || echo "release exists"
-          gh release upload clang-22.1.8-pgo-dylib-rockylinux8 -R "$GITHUB_REPOSITORY" --clobber "/tmp/$NAME" "/tmp/$NAME.sha256"
+          gh release upload $TAG -R "$GITHUB_REPOSITORY" --clobber "/tmp/$NAME" "/tmp/$NAME.sha256"
