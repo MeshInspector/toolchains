@@ -152,6 +152,16 @@ clang 22 only scans that tree up to `gcc-toolset-13`. Install
 `gcc-toolset-13-gcc-c++` — the `-gcc-c++` package, not just `libstdc++-devel`,
 because detection keys on `crtbegin.o` — or the C++ standard library is not found.
 
+This release's profile comes from compiling only, so its `lld` has no PGO counts
+of its own. The recipe on `clang-linux-pgo` now also trains `lld` by linking a
+shared library plainly and with ThinLTO. That build (2026-09-25) linked no faster:
+ThinLTO links -1%, within noise, and the real `mrmeshpy.so` bindings link 53.8 s
+vs 52.1 s, best of 3 each. A `--time-trace` of that link shows why: 98.7% of it is
+the ThinLTO backend in `libLLVM`, which the compile training already covers, and
+lld itself is 1.8 s. So this release was not replaced; the retrained build is not
+published. On macOS the PGO `ld64.lld` did pay off, because the one it replaced
+had no profile at all.
+
 ## clang 18.1.8 PGO dylib (Linux) — `clang-18.1.8-pgo-dylib-linux`
 
 The same recipe, container and flags as the 22.1.8 dylib keg above, built from
