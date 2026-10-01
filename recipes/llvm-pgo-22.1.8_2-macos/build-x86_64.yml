@@ -1,0 +1,96 @@
+name: LLVM Intel Build
+
+# Build clang 22.1.8 with -O3 + PGO + ThinLTO on macos-12-intel via the local
+# tap recipe (llvm.rb + ENV.O3 + the arm-only PGO gate removed), installed with
+# --build-bottle to enable the formula's PGO pipeline. Own rack
+# (Cellar/llvm-pgo), CI stays path-pinned to Cellar/llvm/22.1.7 throughout.
+
+on:
+  push:
+    branches: [ llvm-intel-build ]
+
+jobs:
+  pgo-build:
+    runs-on: macos-12-intel
+    timeout-minutes: 720
+    env:
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - name: Prepare local tap formula
+        run: |
+          brew tap-new local/pgo --no-git 2>/dev/null || true
+          TAPDIR="$(brew --repository)/Library/Taps/local/homebrew-pgo/Formula"
+          mkdir -p "$TAPDIR"
+          curl -fsSL https://raw.githubusercontent.com/Homebrew/homebrew-core/master/Formula/l/llvm.rb -o /tmp/llvm.rb
+          sed -e 's/^class Llvm < Formula/class LlvmPgo < Formula/' \
+              -e 's/^  def install$/  def install\n    ENV.O3/' \
+              -e 's/Hardware::CPU.arm? && //' /tmp/llvm.rb > "$TAPDIR/llvm-pgo.rb"
+          grep -n "class LlvmPgo" "$TAPDIR/llvm-pgo.rb"
+          grep -n "ENV.O3" "$TAPDIR/llvm-pgo.rb"
+          grep -n "pgo_build = " "$TAPDIR/llvm-pgo.rb"
+          df -h / | tail -n1
+
+      - name: Build with -O3 + PGO + ThinLTO (very long)
+        run: |
+          time brew install --quiet --build-bottle local/pgo/llvm-pgo
+          brew list --versions llvm-pgo
+          brew postinstall local/pgo/llvm-pgo 2>&1 | tail -n 10 || true
+
+      - name: Verify -O3 and PGO in build logs
+        run: |
+          L="$HOME/Library/Logs/Homebrew/llvm-pgo"
+          grep -m2 -aE "superenv added:.*-O3" "$L"/01.cmake.cc.log || echo "NO -O3 FOUND"
+          grep -m2 -aE "fprofile|LLVM_BUILD_INSTRUMENTED|LLVM_PROFDATA" "$L"/*.log | head -n 4 || echo "NO PGO MARKERS"
+
+      - name: Bench against existing kegs
+        run: |
+          BP="$(brew --prefix)"
+          cat > /tmp/bench.cpp <<'CPP'
+          #include <regex>
+          #include <ranges>
+          #include <algorithm>
+          #include <map>
+          #include <variant>
+          #include <string>
+          #include <vector>
+          template<int N> struct Fib { static constexpr long v = Fib<N-1>::v + Fib<N-2>::v; };
+          template<> struct Fib<0> { static constexpr long v = 0; };
+          template<> struct Fib<1> { static constexpr long v = 1; };
+          template<int N> long touch() { std::regex r("a+b" + std::to_string(N)); std::map<std::string,std::variant<int,double,std::string>> m; m["x"]=N; return Fib<N%40>::v + (long)m.size(); }
+          template<int... I> long all(std::integer_sequence<int,I...>) { return (touch<I>() + ...); }
+          int main() { auto v = std::views::iota(0,10) | std::views::transform([](int i){return i*i;}); long s=0; for (int x : v) s+=x; return (int)(s + all(std::make_integer_sequence<int,120>{})) & 0; }
+          CPP
+          EXTRA=(-isysroot "$(xcrun --show-sdk-path)")
+          KEGS="$(ls -d "$BP"/Cellar/llvm/* "$BP"/Cellar/llvm-pgo/* 2>/dev/null || true)"
+          for round in 1 2 3 4 5 6 7; do
+            for keg in $KEGS; do
+              CLANG="$keg/bin/clang++"
+              [[ -x "$CLANG" ]] || continue
+              T="$( { /usr/bin/time -p "$CLANG" "${EXTRA[@]}" -std=c++2b -O2 -c /tmp/bench.cpp -o /tmp/bench.o; } 2>&1 | grep '^real' )" || T="real FAIL"
+              echo "round=$round keg=$(basename "$(dirname "$keg")")/$(basename "$keg") $T"
+            done
+          done
+          for keg in $KEGS; do
+            [[ -f "$keg/lib/libclang-cpp.dylib" ]] && { printf "%s: " "$(basename "$(dirname "$keg")")/$(basename "$keg")"; size -m "$keg/lib/libclang-cpp.dylib" | grep "Section __text"; }
+          done
+
+      - name: Tail build logs on failure
+        if: failure()
+        run: |
+          L="$HOME/Library/Logs/Homebrew/llvm-pgo"
+          ls -la "$L" 2>/dev/null || { echo "no llvm-pgo log dir"; exit 0; }
+          for f in "$L"/*; do
+            [[ -f "$f" ]] || continue
+            echo "########## tail of $(basename "$f") ##########"
+            tail -n 120 "$f"
+          done
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macpro-llvm-pgo-build-logs
+          path: ~/Library/Logs/Homebrew/llvm-pgo/
+          retention-days: 7
+          if-no-files-found: warn

@@ -335,6 +335,10 @@ sha256 of the tarballs:
 
 ## Rebuilding
 
+The recipe behind every release (Mesa aside) is also copied, as published, into
+[`recipes/`](recipes/README.md), including the macOS keg build workflows and the
+exact `llvm-pgo.rb` formula, which exist nowhere else.
+
 The Linux recipe is a two-job chain per arch, in a `rockylinux:8` container:
 stage1 `gcc-toolset-11` -> IR-instrumented stage2 trained on compiling
 LLVMSupport/Core/Analysis -> final build with the profile. It lives on a branch

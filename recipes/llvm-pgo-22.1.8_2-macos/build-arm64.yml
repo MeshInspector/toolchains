@@ -1,0 +1,72 @@
+name: LLVM PGO Build
+
+# Throwaway: build clang 22.1.8 with -O3 + PGO + ThinLTO on daniil via a local
+# tap copy of llvm.rb (renamed llvm-pgo -> own Cellar rack, PGO gate satisfied,
+# ENV.O3 defeats superenv's -Os substitution). Then bench against the kegs.
+
+on:
+  push:
+    branches: [ llvm-pgo-build ]
+
+jobs:
+  build:
+    runs-on: macos-13
+    timeout-minutes: 300
+    env:
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - name: Prepare local tap formula
+        run: |
+          brew tap-new local/pgo --no-git 2>/dev/null || true
+          TAPDIR="$(brew --repository)/Library/Taps/local/homebrew-pgo/Formula"
+          mkdir -p "$TAPDIR"
+          curl -fsSL https://raw.githubusercontent.com/Homebrew/homebrew-core/master/Formula/l/llvm.rb -o /tmp/llvm.rb
+          grep -m1 'version\|url ' /tmp/llvm.rb | head -2
+          sed -e 's/^class Llvm < Formula/class LlvmPgo < Formula/' \
+              -e 's/^  def install$/  def install\n    ENV.O3/' /tmp/llvm.rb > "$TAPDIR/llvm-pgo.rb"
+          grep -n "ENV.O3\|class LlvmPgo" "$TAPDIR/llvm-pgo.rb" | head -3
+
+      - name: Build with -O3 + PGO + ThinLTO (long)
+        run: |
+          brew install --quiet --build-bottle local/pgo/llvm-pgo
+          brew list --versions llvm-pgo
+
+      - name: Verify -O3 and PGO in build logs
+        run: |
+          L="$HOME/Library/Logs/Homebrew/llvm-pgo"
+          grep -m2 -aE "superenv added:.*-O3" "$L"/01.cmake.cc.log || echo "NO -O3 FOUND"
+          grep -m2 -aE "fprofile|LLVM_BUILD_INSTRUMENTED|LLVM_PROFDATA" "$L"/*.log | head -4 || echo "NO PGO MARKERS"
+
+      - name: Bench against existing kegs
+        run: |
+          BP="$(brew --prefix)"
+          cat > /tmp/bench.cpp <<'CPP'
+          #include <regex>
+          #include <ranges>
+          #include <algorithm>
+          #include <map>
+          #include <variant>
+          #include <string>
+          #include <vector>
+          template<int N> struct Fib { static constexpr long v = Fib<N-1>::v + Fib<N-2>::v; };
+          template<> struct Fib<0> { static constexpr long v = 0; };
+          template<> struct Fib<1> { static constexpr long v = 1; };
+          template<int N> long touch() { std::regex r("a+b" + std::to_string(N)); std::map<std::string,std::variant<int,double,std::string>> m; m["x"]=N; return Fib<N%40>::v + (long)m.size(); }
+          template<int... I> long all(std::integer_sequence<int,I...>) { return (touch<I>() + ...); }
+          int main() { auto v = std::views::iota(0,10) | std::views::transform([](int i){return i*i;}); long s=0; for (int x : v) s+=x; return (int)(s + all(std::make_integer_sequence<int,120>{})) & 0; }
+          CPP
+          KEGS="$BP/Cellar/llvm/22.1.7 $BP/Cellar/llvm/22.1.8_2 $(ls -d "$BP"/Cellar/llvm-pgo/*)"
+          for round in 1 2 3 4 5 6 7; do
+            for keg in $KEGS; do
+              CLANG="$keg/bin/clang++"
+              [[ -x "$CLANG" ]] || continue
+              T="$( { /usr/bin/time -p "$CLANG" -std=c++2b -O2 -c /tmp/bench.cpp -o /tmp/bench.o; } 2>&1 | grep '^real' )" || T="real FAIL"
+              echo "round=$round keg=$(basename "$(dirname "$keg")")/$(basename "$keg") $T"
+            done
+          done
+          for lib in libclang-cpp.dylib; do
+            for keg in $KEGS; do
+              [[ -f "$keg/lib/$lib" ]] && { printf "%s %s: " "$(basename "$(dirname "$keg")")" "$lib"; size -m "$keg/lib/$lib" | grep "Section __text"; }
+            done
+          done

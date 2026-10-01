@@ -1,0 +1,456 @@
+name: Build clang emsdk PGO
+
+# Build the *Emscripten* clang with -O3 + IR-PGO + ThinLTO, i.e. the same
+# llvm-project revision that emsdk 6.0.9 ships (b158b0ae6, clang 24.0.0git),
+# so the result is a drop-in replacement for /emsdk/upstream/bin in the
+# emscripten/emsdk:6.0.9 images. Upstream (emscripten-releases src/build.py)
+# builds that toolchain with ThinLTO but no PGO; this recipe adds the PGO.
+#
+# Everything runs inside the target image itself, so the produced binaries are
+# guaranteed to run there, and the training step can use the image's own emcc /
+# embuilder to profile the real WebAssembly code paths.
+#
+# Two chained jobs per arch to stay under the 6h hosted-job cap:
+#   stage1: bootstrap clang (+ host compiler-rt, needed for -fprofile-generate),
+#           then the instrumented clang, then training -> clang.profdata
+#   final:  -O3 + PGO + ThinLTO build, validation, benchmark, release upload
+
+on:
+  push:
+    branches: [ clang-emsdk-6.0.9-pgo ]
+  workflow_dispatch:
+    inputs:
+      reuse_run_id:
+        description: "Take stage1 + clang.profdata from this earlier run instead of rebuilding them"
+        required: false
+        default: ""
+
+env:
+  EMSDK_VER: 6.0.9
+  # llvm_project_revision from emscripten-releases DEPS at the 6.0.9 tag
+  LLVM_SHA: b158b0ae6c559f87be325b8f427c5588e6a48823
+  PREFIX: llvm-emsdk-6.0.9-pgo
+  TAG: clang-emsdk-6.0.9-pgo
+  # upstream's toolchain tool list (emscripten-releases src/build.py), minus the
+  # clang-tools-extra entries (clangd, clang-scan-deps) that emscripten never calls
+  TOOLS: clang;lld;llvm-ar;llvm-addr2line;llvm-cov;llvm-cxxfilt;llvm-dwarfdump;llvm-dwp;llvm-nm;llvm-objcopy;llvm-objdump;llvm-profdata;llvm-ranlib;llvm-readobj;llvm-size;llvm-strings;llvm-strip;llvm-symbolizer;clang-resource-headers
+
+jobs:
+  stage1:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+            image: emscripten/emsdk:6.0.9
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            image: emscripten/emsdk:6.0.9-arm64
+    if: ${{ inputs.reuse_run_id == '' }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Environment
+        run: |
+          set -euo pipefail
+          uname -m; nproc; df -h / | tail -1
+          head -2 /etc/os-release
+          /emsdk/upstream/bin/clang --version | head -1
+          ls /emsdk/upstream/bin
+          emcc --version | head -1
+
+      - name: Install build deps
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qqy
+          apt-get install -qqy --no-install-recommends \
+            build-essential cmake ninja-build lld git curl xz-utils zlib1g-dev python3
+          cmake --version | head -1
+          gcc --version | head -1
+
+      - name: Fetch llvm-project at the emsdk revision
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://codeload.github.com/llvm/llvm-project/tar.gz/${LLVM_SHA}" -o llvm.tar.gz
+          tar -xzf llvm.tar.gz
+          mv "llvm-project-${LLVM_SHA}" llvm-project
+          rm llvm.tar.gz
+          grep -h "set(LLVM_VERSION_" llvm-project/cmake/Modules/LLVMVersion.cmake
+
+      # Stage1 provides what the stock emsdk clang cannot: a host profile runtime
+      # (emsdk ships compiler-rt for wasm only, so its clang cannot link
+      # -fprofile-generate binaries) and ld.lld for the final link. The emsdk
+      # clang cannot even serve as the bootstrap compiler: the arm64 one is
+      # cross-built for wasm and reports its own host target as 'unknown', so
+      # stage1 is built with the distro gcc, as in our other PGO recipes.
+      - name: Restore stage1
+        id: stage1-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /opt/stage1
+          key: stage1-${{ matrix.arch }}-${{ env.LLVM_SHA }}-gcc
+
+      - name: Stage 1 (distro gcc -> clang + lld + host compiler-rt)
+        if: steps.stage1-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          cmake -G Ninja -S llvm-project/llvm -B stage1 \
+            -DCMAKE_C_COMPILER=gcc \
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DLLVM_USE_LINKER=lld \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_ENABLE_RUNTIMES="compiler-rt" \
+            -DLLVM_TARGETS_TO_BUILD=Native \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_ZSTD=OFF \
+            -DCMAKE_INSTALL_PREFIX=/opt/stage1
+          ninja -C stage1 install
+          rm -rf stage1
+          /opt/stage1/bin/clang++ --version | head -1
+          ls /opt/stage1/bin/ld.lld
+          find /opt/stage1/lib/clang -name 'libclang_rt.profile*' | grep .
+          df -h / | tail -1
+
+      # actions/cache saves in a post step declared post-if: success(), so any
+      # later failure in this job threw away the two hours stage1 costs. Save it
+      # explicitly the moment it exists instead.
+      - name: Save stage1
+        if: steps.stage1-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /opt/stage1
+          key: stage1-${{ matrix.arch }}-${{ env.LLVM_SHA }}-gcc
+
+      - name: Stage 2 instrumented (IR-PGO)
+        run: |
+          set -euo pipefail
+          # by name on PATH: '-fuse-ld=<path>' is deprecated and warns per link
+          export PATH=/opt/stage1/bin:$PATH
+          cmake -G Ninja -S llvm-project/llvm -B stage2i \
+            -DCMAKE_C_COMPILER=/opt/stage1/bin/clang \
+            -DCMAKE_CXX_COMPILER=/opt/stage1/bin/clang++ \
+            -DLLVM_USE_LINKER=lld \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_TARGETS_TO_BUILD="Native;WebAssembly" \
+            -DLLVM_BUILD_INSTRUMENTED=IR \
+            -DLLVM_BUILD_RUNTIME=No \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_ZSTD=OFF
+          ninja -C stage2i clang clang-resource-headers lld llvm-ar llvm-nm llvm-ranlib \
+            llvm-objcopy llvm-strip llvm-dwarfdump llvm-dwp llvm-symbolizer llvm-size llvm-cxxfilt
+          ./stage2i/bin/clang --version | head -1
+          ./stage2i/bin/clang -print-targets | grep -i wasm
+          df -h / | tail -1
+
+      # emscripten 6.0.x added libopenmp to the system libraries, and it does not
+      # build for wasm64: kmp_platform.h only recognises __wasm32__, so
+      # `embuilder build SYSTEM --wasm64` fails the same way with the image's own
+      # stock clang (emscripten-core/emscripten#27221). Upstream's answer is to
+      # skip the library under MEMORY64, and that landed after 6.0.9 was cut, so
+      # apply the same guard to the image. wasm32 still trains on libopenmp.
+      # Delete this step once emsdk ships emscripten-core/emscripten@14a8c99.
+      - name: Skip libopenmp for wasm64 (emscripten#27221)
+        run: |
+          set -euo pipefail
+          python3 - /emsdk/upstream/emscripten/tools/system_libs.py <<'PY'
+          import sys
+          path = sys.argv[1]
+          src = open(path).read()
+          head, sep, tail = src.partition('\n\ndef get_libs_to_link():')
+          assert sep, 'get_libs_to_link anchor missing'
+          last = head[head.rindex('\nclass '):]
+          assert last.startswith('\nclass libopenmp(Library):'), 'libopenmp is not the last class'
+          guard = ('\n\n  def can_build(self):\n'
+                   '    # emscripten-core/emscripten#27221\n'
+                   '    return super().can_build() and not settings.MEMORY64\n')
+          open(path, 'w').write(head + guard + sep + tail)
+          PY
+          sed -n '/^class libopenmp/,/^def get_libs_to_link/p' \
+            /emsdk/upstream/emscripten/tools/system_libs.py | tail -5
+
+      # Training has two halves: the wasm half (emscripten's own system
+      # libraries, wasm32 and wasm64, through the image's embuilder) covers the
+      # WebAssembly backend, and the host half (a slice of LLVM itself) covers
+      # the frontend and middle-end, which is where most of our compile time
+      # actually goes and which is target-independent.
+      - name: Training
+        run: |
+          set -euo pipefail
+          # %4m, not %m-%p: %p gives every clang invocation its own raw profile,
+          # and the sysroot builds below run thousands of them, which filled the
+          # runner's disk and killed the job. %4m is a bounded four-file pool
+          # that the profile runtime merges into online. Each phase is merged
+          # into a partial profdata and its raw files deleted, so peak disk
+          # stays flat no matter how long training runs.
+          mkdir -p /tmp/prof
+          export LLVM_PROFILE_FILE=/tmp/prof/%4m.profraw
+          export EM_LLVM_ROOT="$PWD/stage2i/bin"
+          export EM_CACHE=/tmp/emcache-train
+          harvest() {
+            local name="$1"
+            echo "--- ${name}: $(ls /tmp/prof | wc -l) raw files, $(du -sh /tmp/prof | cut -f1)"
+            /opt/stage1/bin/llvm-profdata merge -output="/tmp/part-${name}.profdata" /tmp/prof/*.profraw
+            rm -f /tmp/prof/*.profraw
+            ls -la "/tmp/part-${name}.profdata"
+            df -h / | tail -1
+          }
+          embuilder build SYSTEM --force
+          harvest wasm32
+          embuilder build SYSTEM --force --wasm64 2>&1 | tee /tmp/w64.log
+          if grep -m1 '^Building targets:' /tmp/w64.log | grep -qw libopenmp; then
+            echo 'the wasm64 target list still contains libopenmp' >&2
+            exit 1
+          fi
+          harvest wasm64
+          cmake -G Ninja -S llvm-project/llvm -B train \
+            -DCMAKE_C_COMPILER=$PWD/stage2i/bin/clang \
+            -DCMAKE_CXX_COMPILER=$PWD/stage2i/bin/clang++ \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_TARGETS_TO_BUILD="Native;WebAssembly" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF
+          ninja -C train LLVMSupport LLVMCore LLVMAnalysis LLVMCodeGen
+          harvest host
+          /opt/stage1/bin/llvm-profdata merge -output=/tmp/clang.profdata \
+            /tmp/part-wasm32.profdata /tmp/part-wasm64.profdata /tmp/part-host.profdata
+          ls -la /tmp/clang.profdata
+          /opt/stage1/bin/llvm-profdata show --topn=5 /tmp/clang.profdata | head -20
+          rm -rf train stage2i /tmp/prof /tmp/part-*.profdata /tmp/emcache-train
+          df -h / | tail -1
+
+      - name: Pack stage1
+        run: |
+          set -euo pipefail
+          tar -C /opt -czf /tmp/stage1-${{ matrix.arch }}.tar.gz stage1
+          ls -la /tmp/stage1-${{ matrix.arch }}.tar.gz
+
+      - name: Upload stage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage1-${{ matrix.arch }}
+          path: |
+            /tmp/stage1-${{ matrix.arch }}.tar.gz
+            /tmp/clang.profdata
+          retention-days: 3
+          compression-level: 0
+
+  final:
+    needs: stage1
+    # stage1 is skipped when reusing an earlier run's profile, and a skipped
+    # dependency would skip this job too without the always().
+    if: ${{ always() && (inputs.reuse_run_id != '' || needs.stage1.result == 'success') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+            image: emscripten/emsdk:6.0.9
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            image: emscripten/emsdk:6.0.9-arm64
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    timeout-minutes: 350
+    permissions:
+      contents: write
+      actions: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build deps
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qqy
+          apt-get install -qqy --no-install-recommends \
+            build-essential cmake ninja-build lld git curl xz-utils zlib1g-dev python3 ca-certificates
+
+      - name: Fetch llvm-project at the emsdk revision
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://codeload.github.com/llvm/llvm-project/tar.gz/${LLVM_SHA}" -o llvm.tar.gz
+          tar -xzf llvm.tar.gz
+          mv "llvm-project-${LLVM_SHA}" llvm-project
+          rm llvm.tar.gz
+
+      - name: Download stage artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: stage1-${{ matrix.arch }}
+          path: /tmp/
+          run-id: ${{ inputs.reuse_run_id || github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Unpack stage1
+        run: tar -C /opt -xzf /tmp/stage1-${{ matrix.arch }}.tar.gz
+
+      # Same shape as upstream's release configuration (static, ThinLTO,
+      # assertions off, toolchain-only install, static libstdc++) plus
+      # -DLLVM_PROFDATA_FILE, which is the whole point of this recipe.
+      - name: Final build (-O3 + PGO + ThinLTO)
+        run: |
+          set -euo pipefail
+          export PATH=/opt/stage1/bin:$PATH
+          cmake -G Ninja -S llvm-project/llvm -B final \
+            -DCMAKE_C_COMPILER=/opt/stage1/bin/clang \
+            -DCMAKE_CXX_COMPILER=/opt/stage1/bin/clang++ \
+            -DLLVM_USE_LINKER=lld \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_TARGETS_TO_BUILD="Native;WebAssembly" \
+            -DLLVM_PROFDATA_FILE=/tmp/clang.profdata \
+            -DLLVM_ENABLE_LTO=Thin \
+            -DLLVM_PARALLEL_LINK_JOBS=1 \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_BINDINGS=OFF -DLLVM_INSTALL_TOOLCHAIN_ONLY=ON \
+            -DLLVM_STATIC_LINK_CXX_STDLIB=ON \
+            -DCLANG_ENABLE_ARCMT=OFF -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+            -DLLVM_TOOLCHAIN_TOOLS="${TOOLS}" \
+            -DLLVM_DISTRIBUTION_COMPONENTS="${TOOLS}" \
+            -DCMAKE_INSTALL_PREFIX="/opt/${PREFIX}"
+          ninja -C final distribution
+          ninja -C final install-distribution
+          rm -rf final
+          "/opt/${PREFIX}/bin/clang++" --version | head -1
+          ls "/opt/${PREFIX}/bin"
+          du -sh "/opt/${PREFIX}"
+
+      # Packed and uploaded before validation runs: an hour of build output was
+      # lost once because the tarball was only created after a failing check.
+      - name: Pack
+        run: |
+          set -euo pipefail
+          NAME="${TAG}-$(uname -m).tar.gz"
+          tar -C /opt -czf "/tmp/${NAME}" "${PREFIX}"
+          ( cd /tmp && sha256sum "${NAME}" | tee "${NAME}.sha256" )
+          ls -la "/tmp/${NAME}"
+
+      - name: Upload toolchain artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: toolchain-${{ matrix.arch }}
+          path: |
+            /tmp/${{ env.TAG }}-*.tar.gz
+            /tmp/${{ env.TAG }}-*.tar.gz.sha256
+          retention-days: 7
+          compression-level: 0
+
+      - name: Validate against the image's emscripten
+        run: |
+          set -euo pipefail
+          test -d /emsdk/upstream/lib/clang/24
+          node --version
+          export EM_CACHE=/tmp/emcache-pgo
+          printf '#include <cstdio>\n#include <vector>\n#include <algorithm>\nint main(){std::vector<int> v{5,3,1,4,2};std::sort(v.begin(),v.end());for(int x:v)std::printf("%%d",x);std::printf("\\n");}\n' > /tmp/t.cpp
+          export EM_LLVM_ROOT="/opt/${PREFIX}/bin"
+          emcc --version | head -1
+          em++ -O3 -std=c++20 /tmp/t.cpp -o /tmp/t.js
+          node /tmp/t.js
+          em++ -O3 -std=c++20 -pthread -msimd128 /tmp/t.cpp -o /tmp/tp.js
+          node /tmp/tp.js
+          # wasm64: the link must succeed, but whether the module *instantiates*
+          # is the host V8's business -- node 22 here rejects 64-bit table limits
+          # whatever compiler produced them. So a run failure is accepted only
+          # when the stock toolchain fails identically in the same node.
+          em++ -O3 -std=c++20 -sMEMORY64 /tmp/t.cpp -o /tmp/t64.js
+          if node /tmp/t64.js > /tmp/o64.log 2>&1; then
+            echo "wasm64: ran under node: $(cat /tmp/o64.log)"
+          else
+            echo "wasm64: our module did not instantiate:"
+            grep -o "CompileError.*" /tmp/o64.log | head -1 || tail -2 /tmp/o64.log
+            EM_LLVM_ROOT=/emsdk/upstream/bin EM_CACHE=/tmp/emcache-stock em++ -O3 -std=c++20 -sMEMORY64 /tmp/t.cpp -o /tmp/t64s.js
+            if node /tmp/t64s.js > /tmp/o64s.log 2>&1; then
+              echo "but the stock toolchain RAN -- that is a regression in our build" >&2
+              exit 1
+            fi
+            echo "stock toolchain fails the same way -- node limitation, not the toolchain:"
+            grep -o "CompileError.*" /tmp/o64s.log | head -1 || tail -2 /tmp/o64s.log
+          fi
+
+      - name: Benchmark stock vs PGO
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            '#include <algorithm>' \
+            '#include <map>' \
+            '#include <memory>' \
+            '#include <ranges>' \
+            '#include <regex>' \
+            '#include <string>' \
+            '#include <variant>' \
+            '#include <vector>' \
+            'template <int N> struct Fib { static constexpr long v = Fib<N - 1>::v + Fib<N - 2>::v; };' \
+            'template <> struct Fib<0> { static constexpr long v = 0; };' \
+            'template <> struct Fib<1> { static constexpr long v = 1; };' \
+            'int main() {' \
+            '  std::vector<std::variant<int, double, std::string>> v;' \
+            '  std::map<std::string, std::vector<std::shared_ptr<int>>> m;' \
+            '  std::regex re("[a-z]+([0-9]*)");' \
+            '  auto r = v | std::views::filter([](auto&&) { return true; });' \
+            '  (void)std::ranges::distance(r);' \
+            '  return int(Fib<40>::v % 7) + int(m.size()) + int(re.mark_count());' \
+            '}' > /tmp/bench.cpp
+          # Each toolchain keeps its own warm cache: the stock clang uses the
+          # image's prebuilt cache, the PGO clang the one the validation step
+          # just populated. Sharing one cache would make emscripten re-run its
+          # sanity check (or clear the cache) on every toolchain switch.
+          bench() {
+            local root="$1" cache="$2" best=999999 t s i
+            for i in 1 2 3 4 5; do
+              s=$(date +%s%N)
+              EM_LLVM_ROOT="$root" EM_CACHE="$cache" em++ -O3 -std=c++20 -c /tmp/bench.cpp -o /tmp/bench.o
+              t=$(( ($(date +%s%N) - s) / 1000000 ))
+              if [ "$t" -lt "$best" ]; then best=$t; fi
+            done
+            echo "$best"
+          }
+          STOCK_CACHE=/emsdk/upstream/emscripten/cache
+          PGO_CACHE=/tmp/emcache-pgo
+          # one untimed run each, so both caches and both binaries are warm
+          EM_LLVM_ROOT=/emsdk/upstream/bin EM_CACHE="$STOCK_CACHE" em++ -O3 -std=c++20 -c /tmp/bench.cpp -o /tmp/bench.o
+          EM_LLVM_ROOT="/opt/${PREFIX}/bin" EM_CACHE="$PGO_CACHE" em++ -O3 -std=c++20 -c /tmp/bench.cpp -o /tmp/bench.o
+          STOCK=$(bench /emsdk/upstream/bin "$STOCK_CACHE")
+          PGO=$(bench "/opt/${PREFIX}/bin" "$PGO_CACHE")
+          echo "stock emsdk clang: ${STOCK} ms (min of 5)"
+          echo "PGO clang:         ${PGO} ms (min of 5)"
+          python3 -c "print(f'delta: {100*($PGO-$STOCK)/$STOCK:+.1f}%')"
+          {
+            echo "### $(uname -m): template-heavy TU, em++ -O3 -std=c++20 -c, min of 5"
+            echo
+            echo "| toolchain | time |"
+            echo "| --- | --- |"
+            echo "| stock emsdk 6.0.9 clang (ThinLTO, no PGO) | ${STOCK} ms |"
+            echo "| this build (-O3 + PGO + ThinLTO) | ${PGO} ms |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get install -qqy --no-install-recommends gh || {
+            curl -fsSL -o /tmp/gh.deb "https://github.com/cli/cli/releases/download/v2.82.1/gh_2.82.1_linux_$(dpkg --print-architecture).deb"
+            apt-get install -qqy /tmp/gh.deb
+          }
+          NAME="${TAG}-$(uname -m).tar.gz"
+          cat "/tmp/${NAME}.sha256"
+          gh release create "${TAG}" -R "$GITHUB_REPOSITORY" \
+            --title "clang 24.0.0git PGO for emsdk ${EMSDK_VER}" \
+            --notes "Drop-in replacement for /emsdk/upstream/bin in emscripten/emsdk:${EMSDK_VER}: the same llvm-project revision emsdk ships (${LLVM_SHA}, clang 24.0.0git), rebuilt with -O3 + IR-PGO + ThinLTO instead of upstream's ThinLTO-only release configuration. Built inside the emscripten/emsdk:${EMSDK_VER} image itself (Ubuntu noble, glibc 2.39 - emsdk moved off jammy after the 4.x line). Training: emscripten system libraries for wasm32 and wasm64 via embuilder (wasm64 minus libopenmp, which has no wasm64 support upstream), plus a slice of LLVM itself for the frontend and middle-end. Install prefix inside the tarball: ${PREFIX}/." \
+            2>/dev/null || echo "release exists"
+          gh release upload "${TAG}" -R "$GITHUB_REPOSITORY" --clobber "/tmp/${NAME}" "/tmp/${NAME}.sha256"

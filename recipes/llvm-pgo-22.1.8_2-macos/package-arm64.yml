@@ -1,0 +1,37 @@
+name: LLVM PGO Package
+
+# Throwaway: tar daniil's llvm-pgo keg (built for /opt/homebrew, the same
+# prefix GitHub-hosted arm64 runners use) plus a manifest of its linked brew
+# deps, and hand it off as a workflow artifact for release upload.
+
+on:
+  push:
+    branches: [ llvm-pgo-package ]
+
+jobs:
+  package:
+    runs-on: macos-13
+    timeout-minutes: 30
+    steps:
+      - name: Tar the keg and collect the dep manifest
+        run: |
+          BP="$(brew --prefix)"
+          KEG="$BP/Cellar/llvm-pgo/22.1.8_2"
+          test -d "$KEG"
+          mkdir -p /tmp/pkg
+          echo "--- external brew deps referenced by the keg ---" | tee /tmp/pkg/deps.txt
+          find "$KEG/bin" "$KEG/lib" -type f | while read -r f; do
+            file "$f" | grep -q Mach-O || continue
+            otool -L "$f" 2>/dev/null | awk 'NR>1{print $1}'
+          done | grep -E "^$BP" | grep -v "Cellar/llvm-pgo" | sort -u | tee -a /tmp/pkg/deps.txt
+          tar -C "$BP/Cellar" -czf /tmp/pkg/llvm-pgo-22.1.8_2.arm64_opt-homebrew.tar.gz llvm-pgo/22.1.8_2
+          ls -la /tmp/pkg/
+          shasum -a 256 /tmp/pkg/llvm-pgo-22.1.8_2.arm64_opt-homebrew.tar.gz | tee /tmp/pkg/sha256.txt
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-pgo-arm64
+          path: /tmp/pkg/
+          retention-days: 3
+          compression-level: 0
