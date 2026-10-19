@@ -13,7 +13,9 @@ URL that `curl` can fetch anonymously.
 
 | Tag | Platform | Archs | Unpacks to | Size | Status |
 | --- | --- | --- | --- | --- | --- |
-| [`clang-22.1.8-pgo-dylib-linux`](https://github.com/MeshInspector/toolchains/releases/tag/clang-22.1.8-pgo-dylib-linux) | Linux, glibc >= 2.28 | `x86_64`, `aarch64` | `llvm-pgo-dylib-22.1.8/` | ~185 MB | **current** |
+| [`clang-22.1.8_3-pgo-dylib-linux`](https://github.com/MeshInspector/toolchains/releases/tag/clang-22.1.8_3-pgo-dylib-linux) | Linux, glibc >= 2.28 | `x86_64`, `aarch64` | `llvm-pgo-dylib-22.1.8/` | ~200 MB | **current** |
+| [`clang-22.1.8_2-pgo-dylib-linux`](https://github.com/MeshInspector/toolchains/releases/tag/clang-22.1.8_2-pgo-dylib-linux) | Linux, glibc >= 2.28 | `x86_64`, `aarch64` | `llvm-pgo-dylib-22.1.8/` | ~185 MB | superseded |
+| [`clang-22.1.8-pgo-dylib-linux`](https://github.com/MeshInspector/toolchains/releases/tag/clang-22.1.8-pgo-dylib-linux) | Linux, glibc >= 2.28 | `x86_64`, `aarch64` | `llvm-pgo-dylib-22.1.8/` | ~185 MB | superseded |
 | [`clang-emsdk-6.0.9-pgo`](https://github.com/MeshInspector/toolchains/releases/tag/clang-emsdk-6.0.9-pgo) | `emscripten/emsdk:6.0.9` (noble, glibc >= 2.39) | `x86_64`, `aarch64` | `llvm-emsdk-6.0.9-pgo/` | ~114 MB | ready, unused |
 | [`clang-emsdk-5.0.7-pgo`](https://github.com/MeshInspector/toolchains/releases/tag/clang-emsdk-5.0.7-pgo) | `emscripten/emsdk:5.0.7` (noble, glibc >= 2.39) | `x86_64`, `aarch64` | `llvm-emsdk-5.0.7-pgo/` | ~126 MB | pending bump |
 | [`clang-emsdk-4.0.19-pgo`](https://github.com/MeshInspector/toolchains/releases/tag/clang-emsdk-4.0.19-pgo) | `emscripten/emsdk:4.0.19` (jammy, glibc >= 2.35) | `x86_64`, `aarch64` | `llvm-emsdk-4.0.19-pgo/` | ~114 MB | **current** |
@@ -26,8 +28,8 @@ URL that `curl` can fetch anonymously.
 To list them from the command line:
 
     gh release list --repo MeshInspector/toolchains
-    gh release view clang-22.1.8-pgo-dylib-linux --repo MeshInspector/toolchains
-    gh release download clang-22.1.8-pgo-dylib-linux --repo MeshInspector/toolchains --pattern "*x86_64*"
+    gh release view clang-22.1.8_3-pgo-dylib-linux --repo MeshInspector/toolchains
+    gh release download clang-22.1.8_3-pgo-dylib-linux --repo MeshInspector/toolchains --pattern "*x86_64*"
 
 Asset names are stable once published, but a *tag* can be renamed in place (that
 is how `clang-22.1.8-pgo-dylib-rockylinux8` became `clang-22.1.8-pgo-dylib-linux`),
@@ -115,16 +117,32 @@ Only the `bin/` tree is needed by emscripten; the tarball also carries the match
 `lib/clang/<major>` from the same revision, which is why overlaying it onto
 `/emsdk/upstream` works too if `EM_LLVM_ROOT` is inconvenient.
 
-## clang 22.1.8 PGO dylib (Linux) — `clang-22.1.8-pgo-dylib-linux`
+## clang 22.1.8 PGO dylib (Linux) — `clang-22.1.8_3-pgo-dylib-linux`
 
 clang/lld 22.1.8 built with `-O3` + IR-PGO (no LTO), `LLVM_ENABLE_RTTI=ON`, and
 distro-style shared `libLLVM.so` / `libclang-cpp.so`, which is what mrbind links
 against. Built in a `rockylinux:8` container, so the glibc floor is 2.28 and one
-tarball runs on every Linux image we use (RockyLinux 8/9, Ubuntu 22/24).
+tarball runs on every Linux image we use (RockyLinux 8/9, Ubuntu 22/24/26).
+
+Three releases share this recipe and install prefix; each is a superset of the
+one before, so moving up is changing the tag:
+
+| Tag | Adds |
+| --- | --- |
+| `clang-22.1.8-pgo-dylib-linux` | clang, lld, `libLLVM.so`, `libclang-cpp.so` |
+| `clang-22.1.8_2-pgo-dylib-linux` | `lib/LLVMgold.so` (`LLVM_BINUTILS_INCDIR`), the LTO plugin mold, gold and ld.bfd need for `-flto` objects |
+| `clang-22.1.8_3-pgo-dylib-linux` | the compiler-rt sanitizer runtimes in `lib/clang/22/lib/<triple>/`, so `-fsanitize=...` links (xray, libFuzzer, profile, memprof, orc and ctx-profile are not built; +15 MB) |
+
+Sanitizer use in a build whose shared libraries are linked with `-Wl,-z,defs`
+(MeshLib) needs `-shared-libsan`, since the static runtime leaves the handlers
+unresolved in every `.so`; `-frtlib-add-rpath` then writes the runtime's
+directory into the RUNPATH of everything linked, so nothing needs
+`LD_LIBRARY_PATH` at run time. The build verifies that pair on a one-line
+overflow before publishing.
 
 Assets are named after `uname -m`, so no arch mapping is needed:
 
-    TOOLCHAIN=clang-22.1.8-pgo-dylib-linux
+    TOOLCHAIN=clang-22.1.8_3-pgo-dylib-linux
     curl -fsSL "https://github.com/MeshInspector/toolchains/releases/download/${TOOLCHAIN}/${TOOLCHAIN}-$(uname -m).tar.gz" | tar -C /opt -xz
     /opt/llvm-pgo-dylib-22.1.8/bin/clang++ --version
 
@@ -134,13 +152,17 @@ the Python bindings read it), or with
 
 sha256 of the tarballs:
 
+    7cc0f20319d1158fb31f104d1e046831832a68111b724816175a06f5c50375f5  clang-22.1.8_3-pgo-dylib-linux-x86_64.tar.gz
+    1a4c89cd7a4effc878733e0c80a654da861af8db059f5985ac420ad95bab92ec  clang-22.1.8_3-pgo-dylib-linux-aarch64.tar.gz
+    5143637b2fd8bd3615fa434adbf57e98f266a806e497e962ad848665b7711c7d  clang-22.1.8_2-pgo-dylib-linux-x86_64.tar.gz
+    4c056f9556743c0ff32bab50ba76626e98b07a94b20a2c98afa9501fff9bb27d  clang-22.1.8_2-pgo-dylib-linux-aarch64.tar.gz
     97b40230ff3c65e567b532b3a7cff009b0f3d397b3b5311816743a50f5641727  clang-22.1.8-pgo-dylib-linux-x86_64.tar.gz
     41e405b76822e19b7d6cf00db648d290ad78b274fd03a970b91a0bbbb76af5d7  clang-22.1.8-pgo-dylib-linux-aarch64.tar.gz
 
 Each tarball has a `.sha256` sidecar asset that names the tarball itself, so
 fetching both side by side and running `sha256sum -c` just works:
 
-    TOOLCHAIN=clang-22.1.8-pgo-dylib-linux
+    TOOLCHAIN=clang-22.1.8_3-pgo-dylib-linux
     ASSET=${TOOLCHAIN}-$(uname -m).tar.gz
     BASE=https://github.com/MeshInspector/toolchains/releases/download/${TOOLCHAIN}
     curl -fsSL -O "${BASE}/${ASSET}" -O "${BASE}/${ASSET}.sha256"
@@ -318,9 +340,12 @@ sha256 of the tarballs:
 
 ## Who consumes these
 
-- `docker/rockylinux8-vcpkgDockerfile` in our Linux images fetches the Linux
-  dylib keg into `/opt`. The version is pinned by the single
-  `TOOLCHAIN=` line there, plus one `LLVM_PREFIX` env per workflow.
+- MeshLib `docker/ubuntu24Dockerfile` and `docker/ubuntu26Dockerfile` fetch
+  `clang-22.1.8_3-pgo-dylib-linux` (its sanitizer runtimes back the `ubsan`
+  PR label there), `docker/rockylinux8-vcpkgDockerfile` the `_2` release and
+  `docker/emscripten-generate-c-bindingsDockerfile` the first one, all into
+  `/opt`. Each pins the tag in its single `TOOLCHAIN=` line, plus one
+  `LLVM_PREFIX` env per Dockerfile.
 - MeshLib `docker/emscriptenDockerfile` untars the emsdk toolchain straight over
   `/emsdk/upstream` (`--strip-components=1`) so emcc finds it with no `EM_LLVM_ROOT`,
   and derives the tag from its one `EMSDK_VERSION=` line. `master` is on 4.0.19; the

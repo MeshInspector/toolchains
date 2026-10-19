@@ -7,6 +7,8 @@ there on a new branch (see [Rebuilding](../README.md#rebuilding)).
 
 | Release | Recipe | Source |
 | --- | --- | --- |
+| `clang-22.1.8_3-pgo-dylib-linux` | [`clang-22.1.8_3-pgo-dylib-linux/`](clang-22.1.8_3-pgo-dylib-linux/build-clang-linux-pgo.yml) | `clang-linux-pgo` at `8b2ac37` |
+| `clang-22.1.8_2-pgo-dylib-linux` | [`clang-22.1.8_2-pgo-dylib-linux/`](clang-22.1.8_2-pgo-dylib-linux/build-clang-linux-pgo.yml) | `clang-linux-pgo` at `2439e6c` |
 | `clang-22.1.8-pgo-dylib-linux` | [`clang-22.1.8-pgo-dylib-linux/`](clang-22.1.8-pgo-dylib-linux/build-clang-linux-pgo.yml) | `clang-linux-pgo` at `e10991e` |
 | `clang-22.1.8-pgo-rockylinux8` | [`clang-22.1.8-pgo-rockylinux8/`](clang-22.1.8-pgo-rockylinux8/build-clang-linux-pgo.yml) | `clang-linux-pgo` at `369b3b6` |
 | `clang-18.1.8-pgo-dylib-linux` | [`clang-18.1.8-pgo-dylib-linux/`](clang-18.1.8-pgo-dylib-linux/build-clang-linux-pgo.yml) | `clang-18-linux-pgo` at `f9a0d21` |
@@ -16,8 +18,9 @@ there on a new branch (see [Rebuilding](../README.md#rebuilding)).
 | `llvm-pgo-22.1.8_2-arm64`, `llvm-pgo-22.1.8_2-x64` | [`llvm-pgo-22.1.8_2-macos/`](llvm-pgo-22.1.8_2-macos/) | throwaway MeshInspectorCode branches, since deleted |
 | `lld-22.1.8-pgo-macos` | [`build-lld-macos.yml`](../.github/workflows/build-lld-macos.yml), [`install-lld-macos.yml`](../.github/workflows/install-lld-macos.yml) | already on `main` |
 
-`clang-linux-pgo` has since moved on (its head also PGO-trains lld), so the
-22.1.8 rows are pinned to the commits whose runs uploaded the assets.
+`clang-linux-pgo` has moved on since the first release (an lld-training
+attempt in its history was not published), so the 22.1.8 rows are pinned to
+the commits whose runs uploaded the assets.
 
 ## macOS Homebrew kegs
 
