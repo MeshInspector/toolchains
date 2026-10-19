@@ -1,10 +1,10 @@
 name: Build clang linux PGO
 
 # Build clang and lld 22.1.8 with -O3 + PGO (dylib, plus the LLVMgold.so LTO
-# plugin for non-lld linkers) for RockyLinux 8 (glibc 2.28),
-# x64 and arm64, using the upstream 3-stage flow. Split into two chained jobs
-# per arch to stay under the 6h hosted-job cap. The final job publishes the
-# install tree to this repo's releases.
+# plugin for non-lld linkers and the compiler-rt sanitizer runtimes) for
+# RockyLinux 8 (glibc 2.28), x64 and arm64, using the upstream 3-stage flow.
+# Split into two chained jobs per arch to stay under the 6h hosted-job cap.
+# The final job publishes the install tree to this repo's releases.
 
 on:
   push:
@@ -152,6 +152,10 @@ jobs:
             -DLLVM_USE_LINKER=/opt/stage1/bin/ld.lld \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_ENABLE_RUNTIMES="compiler-rt" \
+            -DCOMPILER_RT_BUILD_SANITIZERS=ON \
+            -DCOMPILER_RT_BUILD_XRAY=OFF -DCOMPILER_RT_BUILD_LIBFUZZER=OFF -DCOMPILER_RT_BUILD_PROFILE=OFF \
+            -DCOMPILER_RT_BUILD_MEMPROF=OFF -DCOMPILER_RT_BUILD_ORC=OFF -DCOMPILER_RT_BUILD_CTX_PROFILE=OFF \
             -DLLVM_BINUTILS_INCDIR=/usr/include \
             -DLLVM_TARGETS_TO_BUILD=Native \
             -DLLVM_PROFDATA_FILE=/tmp/clang.profdata \
@@ -165,6 +169,14 @@ jobs:
           /opt/llvm-pgo-dylib-22.1.8/bin/clang++ --version | head -n1
           ls /opt/llvm-pgo-dylib-22.1.8/lib/libLLVM.so /opt/llvm-pgo-dylib-22.1.8/lib/libclang-cpp.so
           ls -l /opt/llvm-pgo-dylib-22.1.8/lib/LLVMgold.so
+          ls /opt/llvm-pgo-dylib-22.1.8/lib/clang/22/lib/*/
+          # the shipped UBSan runtime must link and report, static and as -shared-libsan
+          # (the latter found at load time through -frtlib-add-rpath)
+          printf 'int main(int c,char**){volatile int x=2147483647;x+=c;return 0;}\n' > /tmp/ub.cpp
+          for f in "" -shared-libsan; do
+            /opt/llvm-pgo-dylib-22.1.8/bin/clang++ -fsanitize=signed-integer-overflow $f -frtlib-add-rpath -o /tmp/ub /tmp/ub.cpp
+            /tmp/ub 2>&1 | grep "runtime error: signed integer overflow"
+          done
 
       - name: Pack and publish
         env:
@@ -173,13 +185,13 @@ jobs:
           dnf -y install 'dnf-command(config-manager)' >/dev/null 2>&1 || true
           dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
           dnf -y install gh
-          # a new tag, so the consumers of clang-22.1.8-pgo-dylib-linux move to it explicitly
-          TAG=clang-22.1.8_2-pgo-dylib-linux
+          # a new tag, so the consumers of clang-22.1.8_2-pgo-dylib-linux move to it explicitly
+          TAG=clang-22.1.8_3-pgo-dylib-linux
           NAME="$TAG-$( uname -m ).tar.gz"
           tar -C /opt -czf "/tmp/$NAME" llvm-pgo-dylib-22.1.8
           ( cd /tmp && sha256sum "$NAME" | tee "$NAME.sha256" )
           gh release create $TAG -R "$GITHUB_REPOSITORY" \
-            --title "clang 22.1.8 PGO dylib with LLVMgold.so (Linux)" \
-            --notes "clang/lld 22.1.8 built with -O3 + IR-PGO (no LTO), RTTI, and distro-style libLLVM.so/libclang-cpp.so in a rockylinux:8 container (glibc 2.28). Stage1 gcc-toolset-11; training = compiling LLVMSupport/Core/Analysis. Same as clang-22.1.8-pgo-dylib-linux plus lib/LLVMgold.so (LLVM_BINUTILS_INCDIR=/usr/include), the LTO plugin that mold, gold and ld.bfd need to link -flto objects. Install prefix inside the tarball: llvm-pgo-dylib-22.1.8/." \
+            --title "clang 22.1.8 PGO dylib with LLVMgold.so and compiler-rt sanitizers (Linux)" \
+            --notes "clang/lld 22.1.8 built with -O3 + IR-PGO (no LTO), RTTI, and distro-style libLLVM.so/libclang-cpp.so in a rockylinux:8 container (glibc 2.28). Stage1 gcc-toolset-11; training = compiling LLVMSupport/Core/Analysis. Same as clang-22.1.8_2-pgo-dylib-linux (lib/LLVMgold.so included) plus the compiler-rt sanitizer runtimes in lib/clang/22/lib/<triple>/, so -fsanitize=... links; the xray, libFuzzer, profile, memprof, orc and ctx-profile runtimes are not built. Install prefix inside the tarball: llvm-pgo-dylib-22.1.8/." \
             2>/dev/null || echo "release exists"
           gh release upload $TAG -R "$GITHUB_REPOSITORY" --clobber "/tmp/$NAME" "/tmp/$NAME.sha256"
