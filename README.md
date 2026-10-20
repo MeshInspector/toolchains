@@ -340,12 +340,12 @@ sha256 of the tarballs:
 
 ## Who consumes these
 
-- MeshLib `docker/ubuntu24Dockerfile` and `docker/ubuntu26Dockerfile` fetch
-  `clang-22.1.8_3-pgo-dylib-linux` (its sanitizer runtimes back the `ubsan`
-  PR label there), `docker/rockylinux8-vcpkgDockerfile` the `_2` release and
-  `docker/emscripten-generate-c-bindingsDockerfile` the first one, all into
-  `/opt`. Each pins the tag in its single `TOOLCHAIN=` line, plus one
-  `LLVM_PREFIX` env per Dockerfile.
+- MeshLib `docker/ubuntu26Dockerfile` fetches `clang-22.1.8_3-pgo-dylib-linux`
+  (its sanitizer runtimes back the UBSan job there), `docker/rockylinux8-vcpkgDockerfile`
+  the `_2` release, `docker/ubuntu24Dockerfile` and
+  `docker/emscripten-generate-c-bindingsDockerfile` the first one, all into `/opt`.
+  Each pins the tag in its single `TOOLCHAIN=` line, plus one `LLVM_PREFIX` env
+  per Dockerfile.
 - MeshLib `docker/emscriptenDockerfile` untars the emsdk toolchain straight over
   `/emsdk/upstream` (`--strip-components=1`) so emcc finds it with no `EM_LLVM_ROOT`,
   and derives the tag from its one `EMSDK_VERSION=` line. `master` is on 4.0.19; the
